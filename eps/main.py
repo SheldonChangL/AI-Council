@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -18,9 +19,10 @@ from sqlalchemy.engine import Engine
 from sqlmodel import SQLModel, create_engine
 
 import eps.data  # noqa: F401 - 確保所有資料表註冊到 SQLModel.metadata
-from eps.adapters import LocalCliAdapter
+from eps.adapters import FakeAdapter, LocalCliAdapter, SourceError
+from eps.adapters.base import LLMAdapter
 from eps.api import router as api_router
-from eps.config import get_settings
+from eps.config import Settings, get_settings
 from eps.core.bus import EventBus
 from eps.core.engine import OrchestrationEngine
 from eps.core.jobs import JobManager
@@ -44,6 +46,26 @@ def _enable_sqlite_wal(engine: Engine) -> None:
         conn.exec_driver_sql("PRAGMA journal_mode=WAL")
 
 
+def _build_adapter(settings: Settings) -> LLMAdapter:
+    """依 ``EPS_ADAPTER`` 選擇 LLM 後端（Story 6.3）。
+
+    - 預設 ``"local_cli"``：真實 :class:`LocalCliAdapter`，驅動本機 CLI。
+    - ``"fake"``：決定性 :class:`FakeAdapter`，供跨行程整合測試（subprocess uvicorn）
+      在無真實 I/O 下端到端驗證 CLI ``run --follow`` 串流與報告匯出。可由環境變數調校：
+      ``EPS_FAKE_SOURCE_ERROR`` 設定時 ``validate_source`` 拋 ``SourceError``（測 OPS-1
+      重新登入路徑）；``EPS_FAKE_VALIDATE_DELAY`` 為來源驗證前的延遲秒數，讓觀看端先
+      完成 WS 訂閱，確保不遺漏進度事件。
+    """
+    if settings.adapter == "fake":
+        source_error_msg = os.environ.get("EPS_FAKE_SOURCE_ERROR")
+        delay = float(os.environ.get("EPS_FAKE_VALIDATE_DELAY", "0") or "0")
+        return FakeAdapter(
+            source_error=SourceError(source_error_msg) if source_error_msg else None,
+            validate_delay_seconds=delay,
+        )
+    return LocalCliAdapter(settings=settings)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """啟動時連接 `EPS_DB_URL` 並啟用 SQLite WAL，關閉時釋放連線池。"""
@@ -55,9 +77,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     SQLModel.metadata.create_all(engine)
     seed_persona_templates(engine)
     app.state.db_engine = engine
-    # Story 3.5：注入真實 LocalCliAdapter，使 `/source/status` 以 validate_source()
-    # 真實判定本機 CLI 安裝與登入狀態（AC-1）。測試可覆寫 get_adapter 依賴。
-    adapter = LocalCliAdapter(settings=settings)
+    # Story 3.5：注入 LLM 後端，使 `/source/status` 以 validate_source() 真實判定來源
+    # 就緒狀態（AC-1）。預設真實 LocalCliAdapter；`EPS_ADAPTER=fake` 改注入決定性
+    # FakeAdapter（Story 6.3 跨行程整合測試）。測試可覆寫 get_adapter 依賴。
+    adapter = _build_adapter(settings)
     app.state.adapter = adapter
     # Story 5.2 / AC-1：組裝背景任務排程器，使 `POST /sessions` 能排程研討。
     # EventBus → OrchestrationEngine（注入 repo/adapter/bus）→ JobManager（全域

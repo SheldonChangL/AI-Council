@@ -16,6 +16,8 @@
   :class:`~eps.adapters.base.AdapterTimeout`。
 - **SourceError**：``source_error`` 設定時，``validate_source`` 拋出之
   （預設拋出 :class:`~eps.adapters.base.SourceError`）。
+- **來源驗證延遲**：``validate_delay_seconds`` > 0 時，``validate_source`` 於回傳／
+  拋錯前先 ``await asyncio.sleep``，供跨行程整合測試確保觀看端先完成 WS 訂閱。
 
 序列耗盡後以可預測的衍生字串回退（例如 ``"viewpoint:<persona>@<focus>"``），
 讓未完整腳本化的測試仍具決定性。所有呼叫記錄於 :attr:`calls` 供斷言。
@@ -23,6 +25,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from typing import Deque, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -43,6 +46,7 @@ class FakeAdapter:
         errors: Optional[Mapping[str, BaseException]] = None,
         error_after: Optional[Mapping[str, int]] = None,
         timeouts: Iterable[str] = (),
+        validate_delay_seconds: float = 0.0,
     ) -> None:
         self._viewpoints: Deque[str] = deque(viewpoints)
         self._focuses: Deque[str] = deque(focuses)
@@ -52,6 +56,10 @@ class FakeAdapter:
         self._errors: dict[str, BaseException] = dict(errors or {})
         self._error_after: dict[str, int] = dict(error_after or {})
         self._timeouts = set(timeouts)
+        # 腳本化的來源驗證延遲（秒）：在 validate_source 回傳／拋錯前先 await。讓跨行程
+        # 整合測試（subprocess uvicorn）的 WS 觀看端有時間在研討推進前完成訂閱，避免
+        # 遺漏自 Running 起的進度事件——等同 in-process 測試 ``_GatedAdapter`` 的把關。
+        self._validate_delay_seconds = validate_delay_seconds
         # 記錄每次呼叫 (method, args)，供測試斷言呼叫次序與引數。
         self.calls: List[Tuple[str, tuple]] = []
 
@@ -67,6 +75,8 @@ class FakeAdapter:
                 raise self._errors[method]
 
     async def validate_source(self, source_url: str) -> None:
+        if self._validate_delay_seconds > 0:
+            await asyncio.sleep(self._validate_delay_seconds)
         self._guard("validate_source", source_url)
         if self._source_error is not None:
             raise self._source_error

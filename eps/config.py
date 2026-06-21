@@ -15,6 +15,10 @@ DEFAULT_DB_URL = "sqlite:///./eps.db"
 DEFAULT_CLI_PATH = "codex"
 DEFAULT_MAX_CONCURRENCY = 5
 
+# LLM 後端選擇（Story 6.3）：預設真實本機 CLI 後端；``"fake"`` 改用決定性的
+# ``FakeAdapter``，供跨行程整合測試（subprocess uvicorn）注入無真實 I/O 的後端。
+DEFAULT_ADAPTER = "local_cli"
+
 # NFR-4 / 藍圖 §3.1：並發上限必須小於 10。
 MAX_CONCURRENCY_LIMIT = 10
 
@@ -63,6 +67,7 @@ class Settings:
 
     - ``EPS_DB_URL``：資料庫連線字串，預設為 SQLite 檔。
     - ``EPS_CLI_PATH``：外部 CLI 執行路徑。
+    - ``EPS_ADAPTER``：LLM 後端選擇（``"local_cli"`` 預設／``"fake"`` 決定性後端）。
     - ``EPS_MAX_CONCURRENCY``：最大並發數，須為 1..<10 的整數。
     - ``EPS_STALL_TIMEOUT_SECONDS``：stall 逾時 soft cap（秒），須 > 0（Story 3.4）。
     - ``EPS_MAX_RETRIES``：暫時性失敗的最多重試次數，須 ≥ 0（Story 3.4）。
@@ -73,6 +78,7 @@ class Settings:
 
     db_url: str = DEFAULT_DB_URL
     cli_path: str = DEFAULT_CLI_PATH
+    adapter: str = DEFAULT_ADAPTER
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY
     stall_timeout_seconds: float = DEFAULT_STALL_TIMEOUT_SECONDS
     max_retries: int = DEFAULT_MAX_RETRIES
@@ -125,6 +131,7 @@ class Settings:
         return cls(
             db_url=env.get("EPS_DB_URL", DEFAULT_DB_URL),
             cli_path=env.get("EPS_CLI_PATH", DEFAULT_CLI_PATH),
+            adapter=env.get("EPS_ADAPTER", DEFAULT_ADAPTER),
             max_concurrency=max_concurrency,
             stall_timeout_seconds=_env_float(
                 env, "EPS_STALL_TIMEOUT_SECONDS", DEFAULT_STALL_TIMEOUT_SECONDS
