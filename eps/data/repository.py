@@ -74,8 +74,9 @@ class Repository:
         topic: str,
         max_rounds: int,
         experts: Sequence[Union[str, ExpertSpec]],
+        idempotency_key: Optional[str] = None,
     ) -> Session:
-        """建立會話並寫入參與專家（AC-1 / Story 2.5 AC-2）。
+        """建立會話並寫入參與專家（AC-1 / Story 2.5 AC-2 / Story 5.2 AC-4）。
 
         ``topic`` / ``max_rounds`` 由 ``Session`` 模型驗證（非法值拋出
         ``ValidationError``）。``experts`` 以列舉位置指定連續 ``order_index``
@@ -85,9 +86,18 @@ class Repository:
         ``source_template_id`` 時，依其規則解析 ``persona_prompt``（覆寫優先，否則
         複製模板 ``system_prompt``）寫入 ``SessionExpert``；對應的 ``PersonaTemplate``
         列保持不變（覆寫隔離）。
+
+        ``idempotency_key`` 為選用冪等鍵（Story 5.2 / AC-4）：帶鍵時寫入
+        ``Session.idempotency_key``，由 unique 索引保證唯一；對相同鍵重複建立會由
+        資料庫拋出 ``IntegrityError``，呼叫端負責改以 :meth:`find_session_by_idempotency_key`
+        回傳既有會話（不在此吞掉）。
         """
         with DBSession(self._engine) as db:
-            session = Session(topic=topic, max_rounds=max_rounds)
+            session = Session(
+                topic=topic,
+                max_rounds=max_rounds,
+                idempotency_key=idempotency_key,
+            )
             db.add(session)
             db.flush()  # 取得自增 id 以供 SessionExpert 外鍵引用
             for order_index, raw in enumerate(experts):
@@ -119,6 +129,17 @@ class Repository:
             if template is not None:
                 return template.system_prompt
         return ""
+
+    def find_session_by_idempotency_key(self, key: str) -> Optional[Session]:
+        """依冪等鍵查既有會話；不存在回傳 ``None``（Story 5.2 / AC-4）。
+
+        供 `POST /sessions` 在建立前先查、或在併發 ``IntegrityError`` 後回查既有會話，
+        使帶相同 ``Idempotency-Key`` 的重複請求回傳同一 sessionId。
+        """
+        with DBSession(self._engine) as db:
+            return db.exec(
+                select(Session).where(Session.idempotency_key == key)
+            ).first()
 
     def append_contribution(
         self,

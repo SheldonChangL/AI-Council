@@ -102,6 +102,39 @@ def test_create_session_rejects_blank_topic(repo):
         repo.create_session(topic="   ", max_rounds=3, experts=["A"])
 
 
+# --- Story 5.2 / AC-4：冪等鍵建立與查詢 ---
+def test_create_session_persists_idempotency_key(repo):
+    session = repo.create_session(
+        topic="t", max_rounds=3, experts=["A"], idempotency_key="key-1"
+    )
+    assert session.idempotency_key == "key-1"
+
+
+def test_find_session_by_idempotency_key_roundtrip(repo):
+    created = repo.create_session(
+        topic="t", max_rounds=3, experts=["A"], idempotency_key="key-1"
+    )
+    found = repo.find_session_by_idempotency_key("key-1")
+    assert found is not None and found.id == created.id
+    assert repo.find_session_by_idempotency_key("missing") is None
+
+
+def test_create_session_duplicate_key_violates_unique(repo):
+    repo.create_session(
+        topic="t", max_rounds=3, experts=["A"], idempotency_key="dup"
+    )
+    with pytest.raises(IntegrityError):
+        repo.create_session(
+            topic="t2", max_rounds=3, experts=["B"], idempotency_key="dup"
+        )
+
+
+def test_create_session_null_keys_do_not_collide(repo):
+    s1 = repo.create_session(topic="t1", max_rounds=3, experts=["A"])
+    s2 = repo.create_session(topic="t2", max_rounds=3, experts=["B"])
+    assert s1.id != s2.id  # 多個 NULL 鍵互不衝突
+
+
 # =========================================================================
 # Story 2.5 — 模板選用與覆寫隔離（AC-2）
 # =========================================================================

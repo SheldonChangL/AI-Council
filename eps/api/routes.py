@@ -17,17 +17,23 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, status
+from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError
 
 from eps.adapters.base import AdapterError, LLMAdapter
 from eps.api.schemas import (
+    EXPERTS_MAX,
+    CreateSessionAccepted,
+    CreateSessionRequest,
     PersonaOut,
     SessionDetailOut,
     SessionSummary,
     SourceStatusOut,
 )
+from eps.core.jobs import JobManager
 from eps.data.models import SessionStatus
-from eps.data.repository import Repository
+from eps.data.repository import ExpertSpec, Repository
 
 router = APIRouter()
 
@@ -35,6 +41,15 @@ router = APIRouter()
 def get_repository(request: Request) -> Repository:
     """以 lifespan 建立的 engine 包裝 ``Repository`` 注入端點。"""
     return Repository(request.app.state.db_engine)
+
+
+def get_job_manager(request: Request) -> JobManager:
+    """回傳 lifespan 組裝的 ``JobManager``（背景任務排程器）。
+
+    測試以 ``app.dependency_overrides[get_job_manager]`` 覆寫成 stub，避免真實
+    背景任務驅動本機 CLI。
+    """
+    return request.app.state.job_manager
 
 
 def get_adapter(request: Request) -> LLMAdapter:
@@ -54,6 +69,106 @@ def _session_not_found(session_id: int) -> HTTPException:
             "message": f"session {session_id} not found",
         },
     )
+
+
+def _validation_error(exc: ValidationError) -> HTTPException:
+    """將 ``CreateSessionRequest`` 驗證失敗映射為結構化 HTTP 錯誤（Story 5.2）。
+
+    - experts 超過上限（Pydantic ``too_long`` on ``experts``）→ 400 ``TOO_MANY_EXPERTS``
+      （AC-3）。
+    - 其餘（topic 空、maxRounds 越界、experts 空、name 空…）→ 422 ``INVALID_INPUT``
+      （AC-2）。
+
+    於端點內就地分流（而非全域 handler），避免影響其他端點既有的驗證錯誤行為。
+    """
+    for err in exc.errors():
+        if err.get("type") == "too_long" and "experts" in err.get("loc", ()):
+            return HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "TOO_MANY_EXPERTS",
+                    "message": f"experts 數量超過上限 {EXPERTS_MAX}",
+                },
+            )
+    # 僅保留可 JSON 序列化的欄位（loc/msg/type）；Pydantic 自訂 validator 的 ctx
+    # 可能含例外物件，直接序列化會失敗。
+    fields = [
+        {"loc": list(err.get("loc", ())), "msg": err.get("msg"), "type": err.get("type")}
+        for err in exc.errors()
+    ]
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={
+            "code": "INVALID_INPUT",
+            "message": "請求參數不合法",
+            "errors": fields,
+        },
+    )
+
+
+@router.post(
+    "/sessions",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=CreateSessionAccepted,
+)
+async def create_session(
+    payload: dict = Body(...),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    repo: Repository = Depends(get_repository),
+    jobs: JobManager = Depends(get_job_manager),
+) -> CreateSessionAccepted:
+    """建立會話、驗證並排程背景任務（Story 5.2 / FR-1）。
+
+    - AC-1：合法 payload → 202 ``{sessionId, status:"Created"}`` 並排程背景任務
+      （背景任務隨即進入 ``ValidatingSource`` gate，OPS-1）。
+    - AC-2：``topic`` 空或 ``maxRounds`` 越界 → 422 ``INVALID_INPUT``。
+    - AC-3：``experts`` 超過上限 → 400 ``TOO_MANY_EXPERTS``。
+    - AC-4：帶相同 ``Idempotency-Key`` 的重複請求 → 回傳同一 ``sessionId``（不重複排程）。
+
+    以原始 dict 接收後手動 ``model_validate``，使驗證失敗能依類型分流為 422/400
+    （見 :func:`_validation_error`）。
+    """
+    try:
+        req = CreateSessionRequest.model_validate(payload)
+    except ValidationError as exc:
+        raise _validation_error(exc)
+
+    # AC-4：帶鍵時先查既有會話，命中即回同一 sessionId（不重複建立或排程）。
+    if idempotency_key:
+        existing = repo.find_session_by_idempotency_key(idempotency_key)
+        if existing is not None:
+            return CreateSessionAccepted(
+                session_id=existing.id, status=existing.status
+            )
+
+    experts = [
+        ExpertSpec(
+            name=e.name,
+            source_template_id=e.source_template_id,
+            persona_prompt=e.persona_prompt,
+        )
+        for e in req.experts
+    ]
+    try:
+        session = repo.create_session(
+            topic=req.topic,
+            max_rounds=req.max_rounds,
+            experts=experts,
+            idempotency_key=idempotency_key,
+        )
+    except IntegrityError:
+        # 併發 backstop（AC-4）：同鍵的另一請求已先落地，回查既有會話回同一 id。
+        if idempotency_key:
+            existing = repo.find_session_by_idempotency_key(idempotency_key)
+            if existing is not None:
+                return CreateSessionAccepted(
+                    session_id=existing.id, status=existing.status
+                )
+        raise
+
+    # AC-1：排程背景任務（與 HTTP 連線解耦，隨即進入 ValidatingSource gate）。
+    jobs.start(session.id)
+    return CreateSessionAccepted(session_id=session.id, status=session.status)
 
 
 @router.get("/sessions", response_model=List[SessionSummary])
@@ -120,4 +235,4 @@ async def source_status(
     return SourceStatusOut(valid=True, reason=None)
 
 
-__all__ = ["router", "get_repository", "get_adapter"]
+__all__ = ["router", "get_repository", "get_adapter", "get_job_manager"]

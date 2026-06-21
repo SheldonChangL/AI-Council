@@ -21,6 +21,10 @@ import eps.data  # noqa: F401 - 確保所有資料表註冊到 SQLModel.metadata
 from eps.adapters import LocalCliAdapter
 from eps.api import router as api_router
 from eps.config import get_settings
+from eps.core.bus import EventBus
+from eps.core.engine import OrchestrationEngine
+from eps.core.jobs import JobManager
+from eps.data.repository import Repository
 from eps.data.seed import seed_persona_templates
 
 
@@ -53,7 +57,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.db_engine = engine
     # Story 3.5：注入真實 LocalCliAdapter，使 `/source/status` 以 validate_source()
     # 真實判定本機 CLI 安裝與登入狀態（AC-1）。測試可覆寫 get_adapter 依賴。
-    app.state.adapter = LocalCliAdapter(settings=settings)
+    adapter = LocalCliAdapter(settings=settings)
+    app.state.adapter = adapter
+    # Story 5.2 / AC-1：組裝背景任務排程器，使 `POST /sessions` 能排程研討。
+    # EventBus → OrchestrationEngine（注入 repo/adapter/bus）→ JobManager（全域
+    # semaphore 限制併發）。`JobManager.start` 以 asyncio.create_task 在此運行中的
+    # event loop 上排程，與 HTTP 連線解耦。測試可覆寫 get_job_manager 依賴。
+    bus = EventBus()
+    repo = Repository(engine)
+    job_engine = OrchestrationEngine(
+        repo, adapter, bus, max_focus_chars=settings.max_focus_chars
+    )
+    app.state.event_bus = bus
+    app.state.job_manager = JobManager(
+        job_engine, repo, bus, max_concurrency=settings.max_concurrency
+    )
     try:
         yield
     finally:

@@ -75,7 +75,7 @@ def test_upgrade_head_on_clean_db(clean_db):
     finally:
         engine.dispose()
 
-    assert version == "0003_usage_stats"
+    assert version == "0004_idempotency_key"
 
 
 # --- AC-1：head 建立全部五張表 ---
@@ -128,6 +128,22 @@ def test_session_has_usage_stats_column(upgraded_engine):
     columns = {c["name"]: c for c in inspect(upgraded_engine).get_columns("session")}
     assert "usage_stats" in columns
     assert columns["usage_stats"]["nullable"] is True
+
+
+# --- Story 5.2：session.idempotency_key 欄位（nullable）＋ unique 索引 ---
+def test_session_has_idempotency_key_column(upgraded_engine):
+    columns = {c["name"]: c for c in inspect(upgraded_engine).get_columns("session")}
+    assert "idempotency_key" in columns
+    assert columns["idempotency_key"]["nullable"] is True
+
+
+def test_session_idempotency_key_unique_index(upgraded_engine):
+    indexes = inspect(upgraded_engine).get_indexes("session")
+    idx = next(
+        (x for x in indexes if x["column_names"] == ["idempotency_key"]), None
+    )
+    assert idx is not None, f"缺少 idempotency_key 索引：{indexes}"
+    assert idx["unique"]  # SQLite 反射為 1/0
 
 
 # --- Story 2.5：persona_template.builtin / session_expert.persona_prompt 欄位 ---
