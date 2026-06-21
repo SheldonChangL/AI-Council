@@ -75,7 +75,7 @@ def test_upgrade_head_on_clean_db(clean_db):
     finally:
         engine.dispose()
 
-    assert version == "0002_schema"
+    assert version == "0003_usage_stats"
 
 
 # --- AC-1：head 建立全部五張表 ---
@@ -121,6 +121,13 @@ def test_session_has_final_report_column(upgraded_engine):
     columns = {c["name"]: c for c in inspect(upgraded_engine).get_columns("session")}
     assert "final_report" in columns
     assert columns["final_report"]["nullable"] is True
+
+
+# --- Story 4.6：session.usage_stats 欄位（nullable）---
+def test_session_has_usage_stats_column(upgraded_engine):
+    columns = {c["name"]: c for c in inspect(upgraded_engine).get_columns("session")}
+    assert "usage_stats" in columns
+    assert columns["usage_stats"]["nullable"] is True
 
 
 # --- Story 2.5：persona_template.builtin / session_expert.persona_prompt 欄位 ---

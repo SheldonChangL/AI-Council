@@ -193,6 +193,22 @@ class Repository:
             db.commit()
             return True
 
+    def save_usage_stats(self, session_id: int, usage_stats: str) -> bool:
+        """落地會話用量統計（JSON 文字），單一 transaction（Story 4.6 / OPS-3）。
+
+        僅寫入 ``usage_stats`` 欄位並更新 ``updated_at``，不變動會話狀態——用量統計
+        為「僅監測」，絕不改變或中止會話結果。會話不存在回傳 ``False``。
+        """
+        with DBSession(self._engine) as db:
+            session = db.get(Session, session_id)
+            if session is None:
+                return False
+            session.usage_stats = usage_stats
+            session.updated_at = datetime.now(timezone.utc)
+            db.add(session)
+            db.commit()
+            return True
+
     def list_sessions(
         self,
         status: Optional[SessionStatus] = None,
