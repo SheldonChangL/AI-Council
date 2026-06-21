@@ -14,12 +14,13 @@ from sqlmodel import Session as DBSession
 
 from eps.data.models import (
     Contribution,
+    PersonaTemplate,
     Round,
     Session,
     SessionExpert,
     SessionStatus,
 )
-from eps.data.repository import Repository, SessionDetail
+from eps.data.repository import ExpertSpec, Repository, SessionDetail
 
 
 @pytest.fixture
@@ -99,6 +100,80 @@ def test_create_session_rejects_invalid_max_rounds(repo, max_rounds):
 def test_create_session_rejects_blank_topic(repo):
     with pytest.raises(ValidationError):
         repo.create_session(topic="   ", max_rounds=3, experts=["A"])
+
+
+# =========================================================================
+# Story 2.5 — 模板選用與覆寫隔離（AC-2）
+# =========================================================================
+
+
+def _insert_template(engine, *, name="市場分析師", system_prompt="模板內容") -> int:
+    with DBSession(engine) as db:
+        tpl = PersonaTemplate(name=name, system_prompt=system_prompt, builtin=True)
+        db.add(tpl)
+        db.commit()
+        db.refresh(tpl)
+        return tpl.id
+
+
+def test_create_session_with_template_instantiates_persona_prompt(repo, engine):
+    template_id = _insert_template(engine, system_prompt="原始模板 prompt")
+
+    session = repo.create_session(
+        topic="議題",
+        max_rounds=2,
+        experts=[ExpertSpec(name="分析師", source_template_id=template_id)],
+    )
+
+    with DBSession(engine) as db:
+        expert = db.exec(
+            select(SessionExpert).where(SessionExpert.session_id == session.id)
+        ).first()
+    # 未覆寫時，由模板複製 system_prompt 實例化。
+    assert expert.persona_template_id == template_id
+    assert expert.persona_prompt == "原始模板 prompt"
+
+
+def test_create_session_override_writes_to_expert_not_template(repo, engine):
+    template_id = _insert_template(engine, system_prompt="原始模板 prompt")
+
+    session = repo.create_session(
+        topic="議題",
+        max_rounds=2,
+        experts=[
+            ExpertSpec(
+                name="分析師",
+                source_template_id=template_id,
+                persona_prompt="我的覆寫 prompt",
+            )
+        ],
+    )
+
+    with DBSession(engine) as db:
+        expert = db.exec(
+            select(SessionExpert).where(SessionExpert.session_id == session.id)
+        ).first()
+        template = db.get(PersonaTemplate, template_id)
+
+    # 覆寫值寫入 SessionExpert。
+    assert expert.persona_prompt == "我的覆寫 prompt"
+    assert expert.persona_template_id == template_id
+    # 對應 PersonaTemplate 列保持不變（覆寫隔離）。
+    assert template.system_prompt == "原始模板 prompt"
+
+
+def test_create_session_plain_names_still_supported(repo, engine):
+    # 向後相容：純名稱字串不掛模板、persona_prompt 為空。
+    session = repo.create_session(topic="議題", max_rounds=2, experts=["A", "B"])
+    with DBSession(engine) as db:
+        experts = db.exec(
+            select(SessionExpert)
+            .where(SessionExpert.session_id == session.id)
+            .order_by(SessionExpert.order_index)
+        ).all()
+    assert [e.name for e in experts] == ["A", "B"]
+    assert all(e.persona_template_id is None for e in experts)
+    assert all(e.persona_prompt == "" for e in experts)
 
 
 # --- AC-2：append_contribution 單一 transaction commit ---

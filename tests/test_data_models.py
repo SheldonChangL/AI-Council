@@ -156,6 +156,16 @@ def test_full_session_graph_persists():
     engine.dispose()
 
 
+# --- Story 2.5：PersonaTemplate.builtin / SessionExpert.persona_prompt 預設值 ---
+def test_persona_template_builtin_defaults_false():
+    assert PersonaTemplate(name="x").builtin is False
+
+
+def test_session_expert_persona_prompt_defaults_empty():
+    expert = SessionExpert(session_id=1, name="A")
+    assert expert.persona_prompt == ""
+
+
 # --- Story 2.4：Session.final_report 預設 None 且可持久化 ---
 def test_session_final_report_defaults_none_and_persists():
     engine = create_engine("sqlite://")

@@ -15,17 +15,21 @@ from eps.data.models import (
     SessionStatus,
     TOPIC_MAX_LENGTH,
 )
-from eps.data.repository import Repository, SessionDetail
+from eps.data.repository import ExpertSpec, Repository, SessionDetail
+from eps.data.seed import BUILTIN_PERSONA_TEMPLATES, seed_persona_templates
 
 __all__ = [
     "Contribution",
     "PersonaTemplate",
+    "ExpertSpec",
     "Repository",
     "SessionDetail",
     "Round",
     "Session",
     "SessionExpert",
     "SessionStatus",
+    "BUILTIN_PERSONA_TEMPLATES",
+    "seed_persona_templates",
     "MAX_ROUNDS_MAX",
     "MAX_ROUNDS_MIN",
     "TOPIC_MAX_LENGTH",

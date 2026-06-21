@@ -54,7 +54,11 @@ class SessionStatus(str, Enum):
 
 
 class PersonaTemplate(SQLModel, table=True):
-    """可重用的專家人設範本。"""
+    """可重用的專家人設範本。
+
+    Story 2.5 / AC-1, AC-3：``builtin`` 標示系統內建模板。內建模板為唯讀
+    （不提供修改 API），由 ``eps.data.seed.seed_persona_templates`` 冪等寫入。
+    """
 
     __tablename__ = "persona_template"
 
@@ -62,6 +66,8 @@ class PersonaTemplate(SQLModel, table=True):
     name: str = Field(index=True)
     description: str = ""
     system_prompt: str = ""
+    # Story 2.5 / AC-1：True 表系統內建模板（唯讀），預設為使用者自建（False）。
+    builtin: bool = Field(default=False, index=True)
     created_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -129,7 +135,12 @@ class Session(SQLModel, table=True):
 
 
 class SessionExpert(SQLModel, table=True):
-    """會話中實際參與的專家（由 ``PersonaTemplate`` 實例化）。"""
+    """會話中實際參與的專家（由 ``PersonaTemplate`` 實例化）。
+
+    Story 2.5 / AC-2：``persona_template_id`` 為來源模板（sourceTemplateId），
+    ``persona_prompt`` 承載「實例化後（可覆寫）的人設 prompt」。覆寫值寫入此處，
+    對應的 ``PersonaTemplate`` 列保持不變（覆寫隔離）。
+    """
 
     __tablename__ = "session_expert"
 
@@ -139,6 +150,8 @@ class SessionExpert(SQLModel, table=True):
         default=None, foreign_key="persona_template.id"
     )
     name: str
+    # Story 2.5 / AC-2：實例化後的人設 prompt；覆寫值寫於此，不回寫模板。
+    persona_prompt: str = ""
     # AC-1：會話內專家以連續 order_index（0..n-1）排序寫入。
     order_index: int = 0
     created_at: datetime = Field(default_factory=_utcnow)
