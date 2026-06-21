@@ -49,6 +49,22 @@ class AdapterTimeout(AdapterError):
     """
 
 
+class TransientError(AdapterError):
+    """暫時性、**可重試**的後端錯誤（Story 3.2 / AC-3）。
+
+    例如子行程以非零退出但屬可恢復原因（網路抖動、暫時不可用）。編排層可對
+    此類錯誤套用重試策略；與 :class:`AuthError` 等不可重試錯誤明確區隔。
+    """
+
+
+class AuthError(AdapterError):
+    """認證／授權失敗（**不可重試**）。
+
+    例如外部 CLI 未登入或憑證失效。重試無助於恢復，編排層應直接失敗並要求
+    使用者重新認證，故不歸類為 :class:`TransientError`。
+    """
+
+
 @runtime_checkable
 class LLMAdapter(Protocol):
     """核心編排依賴的 LLM 後端結構型別（藍圖 §6）。
@@ -86,5 +102,7 @@ __all__ = [
     "AdapterError",
     "SourceError",
     "AdapterTimeout",
+    "TransientError",
+    "AuthError",
     "LLMAdapter",
 ]
