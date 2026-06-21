@@ -12,12 +12,39 @@ append-only 保護依賴 ``Contribution`` 的唯一約束 ``(round_id, seq)``：
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 from sqlalchemy.engine import Engine
 from sqlmodel import Session as DBSession, select
 
-from eps.data.models import Contribution, Round, Session, SessionExpert, SessionStatus
+from eps.data.models import (
+    Contribution,
+    PersonaTemplate,
+    Round,
+    Session,
+    SessionExpert,
+    SessionStatus,
+)
+
+
+@dataclass(frozen=True)
+class ExpertSpec:
+    """建立會話時的單一專家規格（Story 2.5 / AC-2）。
+
+    - ``source_template_id``：選用的來源 ``PersonaTemplate`` id（sourceTemplateId）。
+    - ``persona_prompt``：覆寫的人設 prompt；非空時取代模板內容（覆寫隔離）。
+
+    解析規則（``create_session`` 內）：
+    - 提供 ``persona_prompt`` → 直接採用（覆寫）。
+    - 否則提供 ``source_template_id`` → 複製該模板的 ``system_prompt``（實例化）。
+    - 兩者皆無 → 空字串。
+
+    任一情形都只寫入 ``SessionExpert``，不回寫 ``PersonaTemplate``。
+    """
+
+    name: str
+    source_template_id: Optional[int] = None
+    persona_prompt: str = ""
 
 
 @dataclass(frozen=True)
@@ -42,29 +69,55 @@ class Repository:
         self._engine = engine
 
     def create_session(
-        self, topic: str, max_rounds: int, experts: Sequence[str]
+        self,
+        topic: str,
+        max_rounds: int,
+        experts: Sequence[Union[str, ExpertSpec]],
     ) -> Session:
-        """建立會話並寫入參與專家（AC-1）。
+        """建立會話並寫入參與專家（AC-1 / Story 2.5 AC-2）。
 
         ``topic`` / ``max_rounds`` 由 ``Session`` 模型驗證（非法值拋出
         ``ValidationError``）。``experts`` 以列舉位置指定連續 ``order_index``
         （0..n-1），會話與專家於單一 transaction 內原子寫入。
+
+        每個專家可為純名稱字串（無模板、無覆寫）或 ``ExpertSpec``。當 spec 指定
+        ``source_template_id`` 時，依其規則解析 ``persona_prompt``（覆寫優先，否則
+        複製模板 ``system_prompt``）寫入 ``SessionExpert``；對應的 ``PersonaTemplate``
+        列保持不變（覆寫隔離）。
         """
         with DBSession(self._engine) as db:
             session = Session(topic=topic, max_rounds=max_rounds)
             db.add(session)
             db.flush()  # 取得自增 id 以供 SessionExpert 外鍵引用
-            for order_index, name in enumerate(experts):
+            for order_index, raw in enumerate(experts):
+                spec = ExpertSpec(name=raw) if isinstance(raw, str) else raw
+                persona_prompt = self._resolve_persona_prompt(db, spec)
                 db.add(
                     SessionExpert(
                         session_id=session.id,
-                        name=name,
+                        persona_template_id=spec.source_template_id,
+                        name=spec.name,
+                        persona_prompt=persona_prompt,
                         order_index=order_index,
                     )
                 )
             db.commit()
             db.refresh(session)
             return session
+
+    @staticmethod
+    def _resolve_persona_prompt(db: DBSession, spec: ExpertSpec) -> str:
+        """解析寫入 ``SessionExpert`` 的人設 prompt（覆寫隔離，AC-2）。
+
+        覆寫值優先；否則由來源模板複製 ``system_prompt``。僅讀取模板，絕不修改它。
+        """
+        if spec.persona_prompt:
+            return spec.persona_prompt
+        if spec.source_template_id is not None:
+            template = db.get(PersonaTemplate, spec.source_template_id)
+            if template is not None:
+                return template.system_prompt
+        return ""
 
     def append_contribution(
         self,

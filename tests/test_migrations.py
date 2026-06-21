@@ -123,6 +123,30 @@ def test_session_has_final_report_column(upgraded_engine):
     assert columns["final_report"]["nullable"] is True
 
 
+# --- Story 2.5：persona_template.builtin / session_expert.persona_prompt 欄位 ---
+def test_persona_template_has_builtin_column(upgraded_engine):
+    columns = {
+        c["name"]: c
+        for c in inspect(upgraded_engine).get_columns("persona_template")
+    }
+    assert "builtin" in columns
+    assert columns["builtin"]["nullable"] is False
+
+
+def test_persona_template_builtin_index(upgraded_engine):
+    indexes = inspect(upgraded_engine).get_indexes("persona_template")
+    assert any(x["column_names"] == ["builtin"] for x in indexes)
+
+
+def test_session_expert_has_persona_prompt_column(upgraded_engine):
+    columns = {
+        c["name"]: c
+        for c in inspect(upgraded_engine).get_columns("session_expert")
+    }
+    assert "persona_prompt" in columns
+    assert columns["persona_prompt"]["nullable"] is False
+
+
 def test_index_contribution_round_seq(upgraded_engine):
     indexes = inspect(upgraded_engine).get_indexes("contribution")
     assert any(x["column_names"] == ["round_id", "seq"] for x in indexes)

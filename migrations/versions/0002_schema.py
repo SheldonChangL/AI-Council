@@ -13,6 +13,10 @@ Story 2.3 欄位對齊 AC（唯一 schema 建立點，就地修正）：
 
 Story 2.4 就地新增 ``session.final_report``（nullable，1:1 於 session），供
 ``get_session_detail`` 聚合回傳；維持五張表，不新增資料表。
+
+Story 2.5 就地新增 ``persona_template.builtin``（內建模板標記，含索引）與
+``session_expert.persona_prompt``（實例化後可覆寫的人設 prompt，覆寫隔離），
+維持五張表，不新增資料表。
 """
 from __future__ import annotations
 
@@ -35,10 +39,17 @@ def upgrade() -> None:
         sa.Column("name", sqlmodel.sql.sqltypes.AutoString(), nullable=False),
         sa.Column("description", sqlmodel.sql.sqltypes.AutoString(), nullable=False),
         sa.Column("system_prompt", sqlmodel.sql.sqltypes.AutoString(), nullable=False),
+        # Story 2.5：內建模板標記（唯讀模板），既有列預設為非內建。
+        sa.Column(
+            "builtin", sa.Boolean(), nullable=False, server_default=sa.false()
+        ),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_persona_template_name", "persona_template", ["name"], unique=False)
+    op.create_index(
+        "ix_persona_template_builtin", "persona_template", ["builtin"], unique=False
+    )
 
     op.create_table(
         "session",
@@ -92,6 +103,13 @@ def upgrade() -> None:
         sa.Column("session_id", sa.Integer(), nullable=False),
         sa.Column("persona_template_id", sa.Integer(), nullable=True),
         sa.Column("name", sqlmodel.sql.sqltypes.AutoString(), nullable=False),
+        # Story 2.5：實例化後（可覆寫）的人設 prompt；既有列預設空字串。
+        sa.Column(
+            "persona_prompt",
+            sqlmodel.sql.sqltypes.AutoString(),
+            nullable=False,
+            server_default="",
+        ),
         sa.Column("order_index", sa.Integer(), nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.ForeignKeyConstraint(["persona_template_id"], ["persona_template.id"]),
@@ -144,5 +162,6 @@ def downgrade() -> None:
     op.drop_index("ix_session_created_at", table_name="session")
     op.drop_table("session")
 
+    op.drop_index("ix_persona_template_builtin", table_name="persona_template")
     op.drop_index("ix_persona_template_name", table_name="persona_template")
     op.drop_table("persona_template")
