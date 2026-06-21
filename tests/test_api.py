@@ -426,3 +426,55 @@ def test_retry_missing_session_returns_404(client, jobs_stub):
     assert resp.status_code == 404
     assert resp.json()["detail"]["code"] == "SESSION_NOT_FOUND"
     assert jobs_stub.started == []
+
+
+# === Story 5.4 — 最終報告匯出為 Markdown（FR-17 / 藍圖 A6 / AC-1~AC-3）===
+
+
+def _insert_completed_session(engine, *, report="# 最終報告\n\n綜整結論。") -> int:
+    """建立一場已落地最終報告的 Completed 會話，回傳 session id。"""
+    with DBSession(engine) as db:
+        session = Session(
+            topic="議題",
+            max_rounds=3,
+            status=SessionStatus.Completed,
+            final_report=report,
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        return session.id
+
+
+# --- AC-1：Completed 會話 → 200、text/markdown、附檔名 ---
+def test_export_report_returns_200_markdown_with_attachment(client, db_engine):
+    report = "# 最終報告\n\n綜整結論。"
+    session_id = _insert_completed_session(db_engine, report=report)
+
+    resp = client.get(f"/sessions/{session_id}/report.md")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/markdown")
+    disposition = resp.headers["content-disposition"]
+    assert "attachment" in disposition
+    assert f'filename="session-{session_id}-report.md"' in disposition
+    # 內容即落地的最終報告本體。
+    assert resp.text == report
+
+
+# --- AC-2：尚未產出報告的會話 → 409 REPORT_NOT_READY ---
+def test_export_report_not_ready_returns_409(client, db_engine):
+    session_id = _insert_session(db_engine, status=SessionStatus.Running)
+
+    resp = client.get(f"/sessions/{session_id}/report.md")
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "REPORT_NOT_READY"
+
+
+# --- AC-3：不存在的會話 → 404 SESSION_NOT_FOUND ---
+def test_export_report_missing_session_returns_404(client):
+    resp = client.get("/sessions/9999/report.md")
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["code"] == "SESSION_NOT_FOUND"

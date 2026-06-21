@@ -4,6 +4,8 @@
 - ``GET /sessions``：依 createdAt 遞減列出會話摘要，支援 ``limit`` / ``offset`` / ``status``。
 - ``GET /personas``：列出系統內建 Persona 模板（≥3）。
 - ``GET /sessions/{id}``：回傳完整會話聚合；不存在回 404 ``SESSION_NOT_FOUND``。
+- ``GET /sessions/{id}/report.md``（Story 5.4）：將最終報告匯出為 Markdown 檔；
+  未產出報告回 409 ``REPORT_NOT_READY``，不存在回 404 ``SESSION_NOT_FOUND``。
 - ``DELETE /sessions/{id}``：真刪會話，成功回 204；不存在回 404 ``SESSION_NOT_FOUND``。
 - ``GET /source/status``（Story 3.5）：查詢本地 LLM 來源是否就緒，由注入的
   ``LLMAdapter.validate_source()`` 真實判定。
@@ -17,7 +19,17 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 
@@ -90,6 +102,17 @@ def _not_retryable(session_id: int, current: SessionStatus) -> HTTPException:
         detail={
             "code": "NOT_RETRYABLE",
             "message": f"session {session_id} 狀態 {current.value} 不可重試",
+        },
+    )
+
+
+def _report_not_ready(session_id: int) -> HTTPException:
+    """尚未產出最終報告的會話不可匯出（Story 5.4 / AC-2）→ 409 ``REPORT_NOT_READY``。"""
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "REPORT_NOT_READY",
+            "message": f"session {session_id} 尚未產出最終報告",
         },
     )
 
@@ -225,6 +248,37 @@ def get_session(
     if detail is None:
         raise _session_not_found(session_id)
     return SessionDetailOut.from_detail(detail)
+
+
+@router.get("/sessions/{session_id}/report.md")
+def export_report_markdown(
+    session_id: int,
+    repo: Repository = Depends(get_repository),
+) -> Response:
+    """將最終報告匯出為 Markdown 檔（Story 5.4 / FR-17 / 藍圖 A6）。
+
+    - AC-1：已產出報告的會話 → 200，``Content-Type: text/markdown``，並以
+      ``Content-Disposition: attachment`` 帶 ``.md`` 附檔名供下載／保存。
+    - AC-2：尚未產出最終報告（``final_report`` 為空）→ 409 ``REPORT_NOT_READY``。
+    - AC-3：會話不存在 → 404 ``SESSION_NOT_FOUND``。
+
+    僅輕量讀取會話本體（不載入 rounds/contributions），以 ``final_report`` 是否
+    已落地作為「報告就緒」的單一真相來源——報告與 ``Completed`` 終態於同一
+    transaction 原子寫入（見 :meth:`Repository.save_final_report`），故未完成的會話
+    必然無報告，匯出即回 409。
+    """
+    session = repo.get_session(session_id)
+    if session is None:
+        raise _session_not_found(session_id)
+    if not session.final_report:
+        raise _report_not_ready(session_id)
+
+    filename = f"session-{session_id}-report.md"
+    return Response(
+        content=session.final_report,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
