@@ -1,0 +1,70 @@
+"""Story 1.2 — 套件骨架與 config（AC-1, AC-2, AC-3）。"""
+
+import ast
+import importlib
+from pathlib import Path
+
+import pytest
+
+import eps
+from eps.config import (
+    DEFAULT_CLI_PATH,
+    DEFAULT_DB_URL,
+    DEFAULT_MAX_CONCURRENCY,
+    Settings,
+)
+
+SUBPACKAGES = ["api", "core", "adapters", "data", "cli"]
+EPS_ROOT = Path(eps.__file__).parent
+
+
+# AC-1: 各子套件存在且含 __init__.py，可被 import。
+@pytest.mark.parametrize("name", SUBPACKAGES)
+def test_subpackage_exists_and_importable(name):
+    init_file = EPS_ROOT / name / "__init__.py"
+    assert init_file.is_file(), f"缺少 eps/{name}/__init__.py"
+    assert importlib.import_module(f"eps.{name}") is not None
+
+
+# AC-2: 預設值。
+def test_settings_defaults():
+    settings = Settings.from_env(environ={})
+    assert settings.db_url == DEFAULT_DB_URL
+    assert settings.db_url.startswith("sqlite:")
+    assert settings.cli_path == DEFAULT_CLI_PATH
+    assert settings.max_concurrency == DEFAULT_MAX_CONCURRENCY
+    assert settings.max_concurrency < 10
+
+
+# AC-2: 環境變數覆寫。
+def test_settings_reads_env_overrides():
+    env = {
+        "EPS_DB_URL": "sqlite:////tmp/custom.db",
+        "EPS_CLI_PATH": "/usr/local/bin/codex",
+        "EPS_MAX_CONCURRENCY": "8",
+    }
+    settings = Settings.from_env(environ=env)
+    assert settings.db_url == "sqlite:////tmp/custom.db"
+    assert settings.cli_path == "/usr/local/bin/codex"
+    assert settings.max_concurrency == 8
+
+
+def test_settings_rejects_concurrency_over_limit():
+    with pytest.raises(ValueError):
+        Settings.from_env(environ={"EPS_MAX_CONCURRENCY": "10"})
+
+
+def test_settings_rejects_non_integer_concurrency():
+    with pytest.raises(ValueError):
+        Settings.from_env(environ={"EPS_MAX_CONCURRENCY": "abc"})
+
+
+# AC-3: eps 套件內不得使用相對 import。
+def test_no_relative_imports_in_eps():
+    offenders = []
+    for path in EPS_ROOT.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level > 0:
+                offenders.append(f"{path}:{node.lineno}")
+    assert not offenders, f"發現相對 import：{offenders}"
