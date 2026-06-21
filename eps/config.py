@@ -30,6 +30,10 @@ DEFAULT_RETRY_BACKOFF_BASE_SECONDS = 1.0
 # 多輪累積的焦點若超過此上限即壓縮，避免超出模型脈絡上限。
 DEFAULT_MAX_FOCUS_CHARS = 4000
 
+# Story 5.5 / NFR-3 / 藍圖 W1：WebSocket 事件流閒置心跳間隔（秒）。
+# 連線閒置達此秒數即送一次心跳 ping 維持連線（AC-3）。
+DEFAULT_WS_HEARTBEAT_SECONDS = 30.0
+
 
 def _env_int(env: Mapping[str, str], key: str, default: int) -> int:
     """讀取整數環境變數；缺漏套用 ``default``，非整數則拋 ``ValueError``。"""
@@ -64,6 +68,7 @@ class Settings:
     - ``EPS_MAX_RETRIES``：暫時性失敗的最多重試次數，須 ≥ 0（Story 3.4）。
     - ``EPS_RETRY_BACKOFF_BASE_SECONDS``：指數退避基數（秒），須 ≥ 0（Story 3.4）。
     - ``EPS_MAX_FOCUS_CHARS``：焦點字串長度上限（字元數），須 > 0（Story 4.3）。
+    - ``EPS_WS_HEARTBEAT_SECONDS``：WS 事件流閒置心跳間隔（秒），須 > 0（Story 5.5）。
     """
 
     db_url: str = DEFAULT_DB_URL
@@ -73,6 +78,7 @@ class Settings:
     max_retries: int = DEFAULT_MAX_RETRIES
     retry_backoff_base_seconds: float = DEFAULT_RETRY_BACKOFF_BASE_SECONDS
     max_focus_chars: int = DEFAULT_MAX_FOCUS_CHARS
+    ws_heartbeat_seconds: float = DEFAULT_WS_HEARTBEAT_SECONDS
 
     def __post_init__(self) -> None:
         if not 1 <= self.max_concurrency < MAX_CONCURRENCY_LIMIT:
@@ -94,6 +100,10 @@ class Settings:
         if self.max_focus_chars <= 0:
             raise ValueError(
                 f"max_focus_chars 必須 > 0，得到 {self.max_focus_chars}"
+            )
+        if self.ws_heartbeat_seconds <= 0:
+            raise ValueError(
+                f"ws_heartbeat_seconds 必須 > 0，得到 {self.ws_heartbeat_seconds}"
             )
 
     @classmethod
@@ -127,6 +137,9 @@ class Settings:
             ),
             max_focus_chars=_env_int(
                 env, "EPS_MAX_FOCUS_CHARS", DEFAULT_MAX_FOCUS_CHARS
+            ),
+            ws_heartbeat_seconds=_env_float(
+                env, "EPS_WS_HEARTBEAT_SECONDS", DEFAULT_WS_HEARTBEAT_SECONDS
             ),
         )
 

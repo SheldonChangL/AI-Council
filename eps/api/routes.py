@@ -17,7 +17,8 @@ Repository 由 ``app.state.db_engine``（lifespan 建立）包裝注入，端點
 
 from __future__ import annotations
 
-from typing import List, Optional
+import asyncio
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from fastapi import (
     APIRouter,
@@ -28,6 +29,8 @@ from fastapi import (
     Query,
     Request,
     Response,
+    WebSocket,
+    WebSocketDisconnect,
     status,
 )
 from pydantic import ValidationError
@@ -44,9 +47,12 @@ from eps.api.schemas import (
     SessionSummary,
     SourceStatusOut,
 )
+from eps.config import DEFAULT_WS_HEARTBEAT_SECONDS
+from eps.core.bus import EventBus
+from eps.core.events import Event, RoundStarted, StatusChanged
 from eps.core.jobs import JobManager
 from eps.data.models import RETRYABLE_STATUSES, TERMINAL_STATUSES, SessionStatus
-from eps.data.repository import ExpertSpec, Repository
+from eps.data.repository import ExpertSpec, Repository, SessionDetail
 
 router = APIRouter()
 
@@ -369,4 +375,125 @@ async def source_status(
     return SourceStatusOut(valid=True, reason=None)
 
 
-__all__ = ["router", "get_repository", "get_adapter", "get_job_manager"]
+# ---------------------------------------------------------------------------
+# Story 5.5 — WebSocket 事件流 fan-out、心跳與斷線重訂閱回放（FR-11, NFR-3, 藍圖 W1）。
+# ---------------------------------------------------------------------------
+
+# AC-3：閒置心跳訊息。非領域事件（不在 EVENT_REGISTRY），僅作傳輸層 keepalive。
+_HEARTBEAT: Dict[str, Any] = {"type": "ping"}
+
+# 傳輸層 sink：接受一筆已序列化（dict）的訊息送往 client。以此抽象解耦
+# FastAPI ``WebSocket.send_json`` 與核心串流邏輯，使後者可獨立單元測試。
+EventSink = Callable[[Dict[str, Any]], Awaitable[None]]
+
+
+def build_snapshot_events(detail: SessionDetail) -> List[Event]:
+    """AC-2：組出重連時先回放的「目前狀態快照」事件序列。
+
+    以既有事件型別表述目前狀態，client 收到即可對齊、不需重跑：
+
+    - :class:`StatusChanged`：會話目前狀態（最新 status）。
+    - :class:`RoundStarted`（若已有回合）：最新回合序號與其目前焦點（最新回合最後
+      一筆 ``Contribution.focus_after``，無則空字串）。``detail.rounds`` 依
+      ``round_number`` 遞增、``contributions`` 依 ``(round_id, seq)`` 遞增，故最後一筆
+      相符 contribution 即該回合最新焦點。
+    """
+    session_id = detail.session.id
+    events: List[Event] = [
+        StatusChanged(session_id=session_id, status=detail.session.status.value)
+    ]
+    if detail.rounds:
+        latest = detail.rounds[-1]
+        focus = ""
+        for contribution in detail.contributions:
+            if contribution.round_id == latest.id and contribution.focus_after:
+                focus = contribution.focus_after
+        events.append(
+            RoundStarted(
+                session_id=session_id,
+                round_number=latest.round_number,
+                focus=focus,
+            )
+        )
+    return events
+
+
+async def stream_session_events(
+    send: EventSink,
+    bus: EventBus,
+    repo: Repository,
+    session_id: int,
+    *,
+    heartbeat_seconds: float,
+) -> None:
+    """核心串流迴圈：先回放狀態快照，再 fan-out 即時事件並維持心跳。
+
+    與 FastAPI 傳輸細節解耦（``send`` 為注入的 sink），可獨立單元測試。
+
+    順序保證（AC-2 無遺漏對齊）：**先訂閱再讀快照**。先訂閱使讀快照後才發佈的事件
+    必入訂閱佇列、不致遺漏；快照與即時流之間至多重疊一次（client 以最新值對齊，
+    無害）。
+
+    - AC-1：訂閱 ``session_id`` 後即時收取引擎發佈的事件並逐筆 ``send``。
+    - AC-2：訂閱後讀取目前聚合，先送 :func:`build_snapshot_events` 的快照。
+    - AC-3：每筆等待以 ``heartbeat_seconds`` 為逾時上限；閒置逾時即送一次心跳 ping
+      後繼續等待。
+    """
+    async with bus.subscribe(session_id) as sub:
+        # 先訂閱、後讀快照：關閉「讀快照→開始接收」之間的事件遺漏窗口。
+        detail = repo.get_session_detail(session_id)
+        if detail is not None:
+            for event in build_snapshot_events(detail):
+                await send(event.to_dict())
+        while True:
+            try:
+                event = await asyncio.wait_for(sub.get(), timeout=heartbeat_seconds)
+            except asyncio.TimeoutError:
+                await send(_HEARTBEAT)  # AC-3：閒置達上限 → 心跳維持連線。
+                continue
+            except StopAsyncIteration:
+                break  # 訂閱關閉（unsubscribe 哨符）→ 乾淨結束。
+            await send(event.to_dict())
+
+
+@router.websocket("/sessions/{session_id}/events")
+async def session_events(websocket: WebSocket, session_id: int) -> None:
+    """訂閱會話事件流（Story 5.5 / FR-11, NFR-3 / 藍圖 W1）。
+
+    - AC-4：不存在的會話 → 在 upgrade 前 raise 404 ``SESSION_NOT_FOUND``（FastAPI 以
+      WebSocket denial response 回 404），不建立連線。
+    - AC-1/AC-2/AC-3：accept 後委派 :func:`stream_session_events`（先回放快照，再
+      即時 fan-out 並維持心跳）。client 斷線時 ``send_json`` 拋
+      :class:`WebSocketDisconnect`，乾淨結束並由訂閱 context manager 取消訂閱。
+    """
+    repo = Repository(websocket.app.state.db_engine)
+    if repo.get_session(session_id) is None:
+        raise _session_not_found(session_id)  # AC-4：404，不 accept。
+
+    bus: EventBus = websocket.app.state.event_bus
+    heartbeat_seconds = float(
+        getattr(
+            websocket.app.state, "ws_heartbeat_seconds", DEFAULT_WS_HEARTBEAT_SECONDS
+        )
+    )
+    await websocket.accept()
+    try:
+        await stream_session_events(
+            websocket.send_json,
+            bus,
+            repo,
+            session_id,
+            heartbeat_seconds=heartbeat_seconds,
+        )
+    except WebSocketDisconnect:
+        return  # client 主動斷線：訂閱 context manager 已負責清理。
+
+
+__all__ = [
+    "router",
+    "get_repository",
+    "get_adapter",
+    "get_job_manager",
+    "build_snapshot_events",
+    "stream_session_events",
+]
