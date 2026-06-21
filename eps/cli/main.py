@@ -2,7 +2,8 @@
 
 提供子命令，皆經既有 REST/WS API 操作，CLI 本身不含業務規則：
 
-- ``run``：以 ``POST /sessions`` 建立研討會話並印出 ``sessionId``（6.1 AC-2）。
+- ``run``：以 ``POST /sessions`` 建立研討會話並印出 ``sessionId``（6.1 AC-2）；加
+  ``--follow`` 則串流各輪各專家進度並於結束時印出最終報告文字（6.3 AC-1~AC-3）。
 - ``status``：以 ``GET /sessions/{id}`` 查詢並印出目前狀態（6.1 AC-3）。
 - ``watch``：連 ``/sessions/{id}/events`` WS，以 Rich 串流顯示各輪各專家進度
   （6.2 AC-1~AC-3）。
@@ -66,23 +67,68 @@ def run(
         "--expert",
         help="參與專家，可重複；格式為『名稱』或『名稱=人設提示』。",
     ),
+    follow: bool = typer.Option(
+        False,
+        "--follow",
+        help="建立後即串流各輪各專家進度，結束時於 stdout 印出最終報告文字。",
+    ),
     base_url: Optional[str] = typer.Option(
         None, "--base-url", help="API base URL；預設讀取 EPS_API_BASE_URL。"
     ),
 ) -> None:
-    """建立研討會話並印出 sessionId（AC-2）。"""
+    """建立會話並印出 sessionId；``--follow`` 時串流進度並輸出最終報告（Story 6.3）。
+
+    - 預設（無 ``--follow``）：``POST /sessions`` 建立會話後印出 ``sessionId``（6.1 AC-2）。
+    - ``--follow``：建立後連 WS 串流各輪各專家進度（進度與 ``sessionId`` 寫 stderr），
+      收到 ``ReportCompleted`` → 取 ``GET /sessions/{id}/report.md`` 將最終報告**文字**
+      印至 stdout（與 Web 共用核心、逐字一致，AC-1/AC-2）；收到 ``SessionFailed`` →
+      渲染失敗原因（含重新登入提示）並以非零碼結束，不輸出臆造報告（AC-3 / OPS-1）。
+    """
     experts = [_parse_expert(e) for e in expert]
     try:
         with _make_client(base_url) as client:
             body = client.create_session(
                 topic=topic, max_rounds=max_rounds, experts=experts
             )
+            session_id = body["sessionId"]
+            if not follow:
+                typer.echo(f"sessionId: {session_id}")
+                return
+            _follow_session(client, session_id)
     except httpx.HTTPStatusError as exc:
         _fail_from_response(exc.response)
     except httpx.HTTPError as exc:
         typer.echo(f"無法連線到服務：{exc}", err=True)
         raise typer.Exit(code=1)
-    typer.echo(f"sessionId: {body['sessionId']}")
+
+
+def _follow_session(client: EpsClient, session_id: int) -> None:
+    """串流會話進度直到終態，完成則輸出最終報告，失敗則非零碼結束（Story 6.3）。
+
+    進度與 ``sessionId`` 一律寫入 **stderr**（保持 stdout 純粹為最終報告文字，使
+    ``--follow`` 的 stdout 與 ``GET /sessions/{id}/report.md`` 內容逐字一致，AC-2）。
+    """
+    # 進度走 stderr，最終報告走 stdout：兩股輸出分離（AC-1/AC-2）。
+    progress_console = Console(stderr=True)
+    progress_console.print(f"sessionId: {session_id}")
+    renderer = ProgressRenderer(progress_console)
+    try:
+        with client.stream_events(session_id) as events:
+            for message in events:
+                if renderer.handle(message):
+                    break
+    except WatchConnectionError as exc:
+        typer.echo(f"無法連線事件流：{exc}", err=True)
+        raise typer.Exit(code=1)
+
+    if renderer.failed:
+        # OPS-1：SessionFailed 原因（含重新登入提示）已由 renderer 印至 stderr；
+        # 以非零碼結束且不輸出任何（臆造的）報告。
+        raise typer.Exit(code=1)
+
+    # 完成：取與 Web 同一支匯出端點的報告文字印至 stdout（FR-12 / AC-2）。
+    report = client.get_report_markdown(session_id)
+    typer.echo(report)
 
 
 @app.command()

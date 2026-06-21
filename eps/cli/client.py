@@ -112,6 +112,18 @@ class EpsClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_report_markdown(self, session_id: int) -> str:
+        """``GET /sessions/{id}/report.md``：回傳最終報告 Markdown 文字（Story 6.3）。
+
+        CLI ``run --follow`` 於串流結束（``ReportCompleted``）後呼叫，直接取用與 Web
+        同一支匯出端點的內容印至 stdout，使 CLI 與 Web 報告**共用核心、逐字一致**
+        （FR-12 / AC-2）。報告未就緒（409）或會話不存在（404）由 ``raise_for_status``
+        拋 ``HTTPStatusError``，供命令層轉為結構化錯誤。
+        """
+        resp = self._http.get(f"/sessions/{session_id}/report.md")
+        resp.raise_for_status()
+        return resp.text
+
     @contextmanager
     def stream_events(self, session_id: int) -> Iterator[Iterator[Dict[str, Any]]]:
         """訂閱 ``/sessions/{id}/events`` WS 事件流（Story 6.2 / FR-11）。
