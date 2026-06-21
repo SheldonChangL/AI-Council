@@ -28,7 +28,10 @@
 
 from __future__ import annotations
 
-from eps.adapters.base import LLMAdapter, SourceError
+import asyncio
+from typing import Optional
+
+from eps.adapters.base import AdapterError, LLMAdapter, SourceError
 from eps.config import DEFAULT_MAX_FOCUS_CHARS
 from eps.core import focus as focus_ops
 from eps.core.bus import EventBus
@@ -41,10 +44,21 @@ from eps.core.events import (
     ReportCompleted,
     RoundStarted,
     RoundSummary,
+    SessionFailed,
     StatusChanged,
 )
 from eps.data.models import SessionStatus
 from eps.data.repository import Repository
+
+# 失敗終態對外的 SessionFailed.reason（Story 4.5）。
+# 來源失效須含「重新登入後重試」提示（AC-2）；其餘為一般使用者可讀說明。
+SOURCE_INVALID_REASON = "來源已失效，請重新登入後重試。"
+CANCELLED_REASON = "會話已被取消，已保存的部分結果可供重試。"
+FAILED_REASON = "執行失敗：重試已耗盡。"
+
+
+class _Cancelled(Exception):
+    """內部訊號：偵測到取消請求，供 :meth:`OrchestrationEngine.run` 統一轉為終態。"""
 
 
 class OrchestrationEngine:
@@ -68,11 +82,27 @@ class OrchestrationEngine:
         self._bus = bus
         self._max_focus_chars = max_focus_chars
 
-    async def run(self, session_id: int) -> SessionRuntime:
+    async def run(
+        self,
+        session_id: int,
+        *,
+        cancel_token: Optional[asyncio.Event] = None,
+    ) -> SessionRuntime:
         """執行一場會話的完整編排，回傳終態的 :class:`SessionRuntime`。
 
         來源驗證失敗（:class:`SourceError`）時轉為 ``SourceInvalid`` 並提前結束；
-        正常跑完 ``max_rounds`` 後落地最終報告並轉為 ``Completed``（AC-3）。
+        正常跑完 ``max_rounds`` 後落地最終報告並轉為 ``Completed``。
+
+        失敗與取消路徑（Story 4.5 / FR-14, OPS-1, OPS-2）——皆保留已落地的
+        ``Contribution``／回合總結（append-only，不刪除即保留）並發出
+        ``StatusChanged`` + ``SessionFailed``，**不臆造內容**（提前 return，不呼叫
+        ``compose_final_report``）：
+
+        - 傳入 ``cancel_token`` 且於回合／專家邊界偵測到 set → ``Cancelled``（AC-1）。
+        - 執行中 adapter 拋 :class:`SourceError`（來源失效）→ ``SourceInvalid``，
+          ``SessionFailed.reason`` 含「重新登入後重試」提示（AC-2）。
+        - 其餘 :class:`AdapterError`（含重試耗盡 :class:`RetryExhaustedError`、
+          ``AuthError``、``AdapterTimeout``）→ ``Failed``（AC-3）。
         """
         runtime = self._load_runtime(session_id)
 
@@ -90,10 +120,23 @@ class OrchestrationEngine:
         # 第一輪起始焦點為議題本身；其後每輪以上一輪總結為起點（FR-7, FR-10）。
         focus = runtime.topic
         round_summaries: list[str] = []
-        for round_number in range(1, runtime.max_rounds + 1):
-            focus = await self._run_round(runtime, round_number, focus, round_summaries)
+        try:
+            for round_number in range(1, runtime.max_rounds + 1):
+                self._raise_if_cancelled(cancel_token)
+                focus = await self._run_round(
+                    runtime, round_number, focus, round_summaries, cancel_token
+                )
+        except _Cancelled:
+            await self._fail(runtime, SessionStatus.Cancelled, CANCELLED_REASON)
+            return runtime
+        except SourceError:
+            await self._fail(runtime, SessionStatus.SourceInvalid, SOURCE_INVALID_REASON)
+            return runtime
+        except AdapterError as exc:  # 重試耗盡等非來源類失敗 → Failed（OPS-1）。
+            await self._fail(runtime, SessionStatus.Failed, str(exc) or FAILED_REASON)
+            return runtime
 
-        # --- 收尾：依全程演進脈絡產出最終報告並落地（AC-3）---
+        # --- 收尾：依全程演進脈絡產出最終報告並落地 ---
         report = await self._adapter.compose_final_report(runtime.topic, round_summaries)
         self._repo.save_final_report(session_id, report)
         runtime.status = SessionStatus.Completed
@@ -106,6 +149,7 @@ class OrchestrationEngine:
         round_number: int,
         focus: str,
         round_summaries: list[str],
+        cancel_token: Optional[asyncio.Event] = None,
     ) -> str:
         """跑完單一回合：逐位專家發言、彙整焦點、產生回合總結。
 
@@ -121,6 +165,8 @@ class OrchestrationEngine:
         )
 
         for seq, expert in enumerate(runtime.experts):
+            # 專家邊界檢查取消：命中時本輪已落地的發言保留，停止後續推進（AC-1）。
+            self._raise_if_cancelled(cancel_token)
             await self._publish(
                 ExpertStarted(
                     session_id=session_id,
@@ -206,6 +252,33 @@ class OrchestrationEngine:
         self._repo.set_status(runtime.session_id, status)
         await self._publish(
             StatusChanged(session_id=runtime.session_id, status=status.value)
+        )
+
+    @staticmethod
+    def _raise_if_cancelled(cancel_token: Optional[asyncio.Event]) -> None:
+        """若取消旗標已 set 則拋 :class:`_Cancelled`，供回合／專家邊界檢查（AC-1）。"""
+        if cancel_token is not None and cancel_token.is_set():
+            raise _Cancelled
+
+    async def _fail(
+        self, runtime: SessionRuntime, status: SessionStatus, reason: str
+    ) -> None:
+        """轉入失敗終態並對外通知：``StatusChanged(status)`` + ``SessionFailed``。
+
+        已落地的 ``Contribution``／回合總結為 append-only，於此不刪除即自動保留
+        （AC-1/AC-2/AC-3）。``partialAvailable`` 以是否已有任何發言落地判定
+        （重用 :meth:`Repository.get_resume_position`，None 表尚無部分結果）。
+        """
+        await self._transition(runtime, status)
+        partial_available = (
+            self._repo.get_resume_position(runtime.session_id) is not None
+        )
+        await self._publish(
+            SessionFailed(
+                session_id=runtime.session_id,
+                reason=reason,
+                partial_available=partial_available,
+            )
         )
 
     async def _publish(self, event: Event) -> None:
