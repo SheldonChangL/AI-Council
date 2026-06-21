@@ -137,7 +137,8 @@ class SessionExpert(SQLModel, table=True):
         default=None, foreign_key="persona_template.id"
     )
     name: str
-    position: int = 0
+    # AC-1：會話內專家以連續 order_index（0..n-1）排序寫入。
+    order_index: int = 0
     created_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -172,7 +173,9 @@ class Contribution(SQLModel, table=True):
     round_id: int = Field(foreign_key="round.id", index=True)
     session_expert_id: int = Field(foreign_key="session_expert.id", index=True)
     seq: int = Field(default=0)
-    content: str = ""
+    # AC-2：append_contribution(... viewpoint, focus_after) 落地的語意里程碑欄位。
+    viewpoint: str = ""
+    focus_after: Optional[str] = Field(default=None)
     created_at: datetime = Field(default_factory=_utcnow)
 
 

@@ -132,7 +132,7 @@ def test_full_session_graph_persists():
         session.refresh(sess)
 
         expert = SessionExpert(
-            session_id=sess.id, persona_template_id=persona.id, name="A", position=0
+            session_id=sess.id, persona_template_id=persona.id, name="A", order_index=0
         )
         session.add(expert)
         session.commit()
@@ -144,7 +144,7 @@ def test_full_session_graph_persists():
         session.refresh(rnd)
 
         contribution = Contribution(
-            round_id=rnd.id, session_expert_id=expert.id, content="贊成"
+            round_id=rnd.id, session_expert_id=expert.id, viewpoint="贊成"
         )
         session.add(contribution)
         session.commit()

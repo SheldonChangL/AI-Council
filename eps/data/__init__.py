@@ -15,10 +15,12 @@ from eps.data.models import (
     SessionStatus,
     TOPIC_MAX_LENGTH,
 )
+from eps.data.repository import Repository
 
 __all__ = [
     "Contribution",
     "PersonaTemplate",
+    "Repository",
     "Round",
     "Session",
     "SessionExpert",

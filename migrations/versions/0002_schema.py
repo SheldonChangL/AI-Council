@@ -1,4 +1,4 @@
-"""schema — 建立五張表與索引/約束（Story 2.2 / FR-15, FR-16 / 藍圖 §3.2）。
+"""schema — 建立五張表與索引/約束（Story 2.2, 2.3 / FR-15, FR-16 / 藍圖 §3.2）。
 
 於 baseline 之後建立全部資料表，並建立 AC-2 要求的唯一約束與索引：
 - 唯一約束 ``Round(session_id, round_number)``、``Contribution(round_id, seq)``。
@@ -6,6 +6,10 @@
 
 ``ix_session_created_at`` 為表達式（DESC）索引，autogenerate 在 SQLite 無法反射，
 故於此手動建立。
+
+Story 2.3 欄位對齊 AC（唯一 schema 建立點，就地修正）：
+``session_expert.order_index``、``contribution.viewpoint`` 與新增的
+``contribution.focus_after``。
 """
 from __future__ import annotations
 
@@ -83,7 +87,7 @@ def upgrade() -> None:
         sa.Column("session_id", sa.Integer(), nullable=False),
         sa.Column("persona_template_id", sa.Integer(), nullable=True),
         sa.Column("name", sqlmodel.sql.sqltypes.AutoString(), nullable=False),
-        sa.Column("position", sa.Integer(), nullable=False),
+        sa.Column("order_index", sa.Integer(), nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.ForeignKeyConstraint(["persona_template_id"], ["persona_template.id"]),
         sa.ForeignKeyConstraint(["session_id"], ["session.id"]),
@@ -99,7 +103,8 @@ def upgrade() -> None:
         sa.Column("round_id", sa.Integer(), nullable=False),
         sa.Column("session_expert_id", sa.Integer(), nullable=False),
         sa.Column("seq", sa.Integer(), nullable=False),
-        sa.Column("content", sqlmodel.sql.sqltypes.AutoString(), nullable=False),
+        sa.Column("viewpoint", sqlmodel.sql.sqltypes.AutoString(), nullable=False),
+        sa.Column("focus_after", sqlmodel.sql.sqltypes.AutoString(), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.ForeignKeyConstraint(["round_id"], ["round.id"]),
         sa.ForeignKeyConstraint(["session_expert_id"], ["session_expert.id"]),
