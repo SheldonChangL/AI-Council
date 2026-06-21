@@ -1,27 +1,22 @@
-# Story 2.3 — Repository 建立會話與 append-only 寫入（[prereq]）
+# Story 2.4 — Repository 查詢、刪除與恢復位置（[prereq]）
 
 ## 決策
-- AC 為權威契約（沿用 Story 2.2 慣例）：將暫定欄位名對齊 AC。
-  - `SessionExpert.position` → `order_index`（AC-1 明列）。
-  - `Contribution.content` → `viewpoint`，新增 `focus_after`（AC-2 簽章明列）。
-- 0002_schema migration 為唯一 schema 建立點（尚未發布），就地修改欄位名，head 維持 `0002_schema`，不新增 rename migration。
-- `experts` 採最小契約：專家名稱字串序列，`order_index` 由列舉位置（0..n-1）指定。
-- append-only 保護沿用既有唯一約束 `(round_id, seq)`，重複寫入讓 `IntegrityError` 傳播。
+- AC 為權威契約（沿用 Story 2.2/2.3 慣例）。
+- `final_report` 在 repo 不存在。最小且不破壞「五張表」架構的作法：在 `session` 新增 nullable `final_report` 欄位（每場會話 1:1），而非新增第六張表。`0002_schema` 為唯一且尚未發布的 schema 建立點，就地新增欄位，head 維持 `0002_schema`。
+- `get_session_detail` 回傳 frozen dataclass `SessionDetail`（session/experts/rounds/contributions/final_report），rounds/contributions 採扁平排序清單（rounds 依 round_number、contributions 依 (round_id, seq)）；查無回傳 `None`（即 AC-4「找不到」）。
+- `get_resume_position` 以 Contribution join Round，取字典序最大 `(round_number, seq)`（seq 僅存在於 Contribution，座標必來自發言列）；無任何發言/會話不存在回傳 `None`。
+- `delete_session` 真刪，依外鍵由子到父刪除，單一 transaction；成功回 `True`、不存在回 `False`。
+- `list_sessions` 依 `created_at desc, id desc`（穩定次序，最新優先），`status` 可選過濾，提供 `limit/offset`。
 
 ## 計畫
-- [x] `eps/data/models.py`：`position`→`order_index`；`content`→`viewpoint`；新增 `focus_after: Optional[str]`
-- [x] `migrations/versions/0002_schema.py`：對齊上述欄位名與新增 `focus_after`
-- [x] `eps/data/repository.py`：`Repository.create_session` / `append_contribution`
-- [x] `eps/data/__init__.py`：匯出 `Repository`
-- [x] `tests/test_data_models.py`：更新 `order_index` / `viewpoint` 用法
-- [x] `tests/test_repository.py`：AC-1（連續 order_index）、AC-2（單一 transaction commit）、AC-3（重複 (round_id, seq) 被拒）
+- [x] `eps/data/models.py`：`Session` 新增 `final_report: Optional[str] = None`
+- [x] `migrations/versions/0002_schema.py`：session 新增 `final_report` 欄位
+- [x] `eps/data/repository.py`：`SessionDetail` + `list_sessions` / `get_session_detail` / `get_resume_position` / `delete_session`
+- [x] `eps/data/__init__.py`：匯出 `SessionDetail`
+- [x] `tests/test_repository.py`：AC-1~AC-4 與邊界（無相符 status、空發言續跑、查無詳情、刪除不存在）
+- [x] `tests/test_data_models.py`：`final_report` 預設 None 且可持久化
+- [x] `tests/test_migrations.py`：session 具 nullable `final_report` 欄位
 - [x] 驗證：`alembic upgrade head` 乾淨建庫；完整 pytest 全綠
 
 ## Review
-- `Repository(engine)` 提供 `create_session(topic, max_rounds, experts)` 與 `append_contribution(round_id, expert_id, seq, viewpoint, focus_after=None)`，皆以 `with Session(engine)` 包成單一 transaction。
-- AC-1：`create_session` 用 `flush()` 取得 session.id 後，以 `enumerate(experts)` 寫入連續 `order_index`（0..n-1），會話與專家原子 commit；topic/max_rounds 仍由 `Session` 模型驗證。
-- AC-2：`append_contribution` 單一 insert 單一 commit，commit 後可讀回（含 `focus_after`）。
-- AC-3：沿用既有唯一約束 `(round_id, seq)`，重複寫入讓 `IntegrityError` 傳播，不吞錯。
-- Schema 對齊：依 Story 2.2 慣例（AC 為權威契約）就地修正 `0002_schema`——`order_index`、`viewpoint`、新增 `focus_after`；head 維持 `0002_schema`，未新增 rename migration。orchestrator 標示的兩個落差即由此解決。
-- 驗證：`pytest` 76 passed（新增 10）；乾淨 SQLite `alembic upgrade head` 成功，inspector 確認 `session_expert.order_index`、`contribution.viewpoint` / `focus_after` 欄位到位。
-- 未提交：依規範未 push。
+- 見最終 handoff；四個 AC 皆於 repository 層測試覆蓋，並補 model/migration 欄位測試。

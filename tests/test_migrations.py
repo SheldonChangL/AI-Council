@@ -116,6 +116,13 @@ def test_index_session_status(upgraded_engine):
     assert any(x["column_names"] == ["status"] for x in indexes)
 
 
+# --- Story 2.4：session.final_report 欄位（nullable）---
+def test_session_has_final_report_column(upgraded_engine):
+    columns = {c["name"]: c for c in inspect(upgraded_engine).get_columns("session")}
+    assert "final_report" in columns
+    assert columns["final_report"]["nullable"] is True
+
+
 def test_index_contribution_round_seq(upgraded_engine):
     indexes = inspect(upgraded_engine).get_indexes("contribution")
     assert any(x["column_names"] == ["round_id", "seq"] for x in indexes)

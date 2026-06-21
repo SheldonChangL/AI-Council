@@ -12,8 +12,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import SQLModel, create_engine, select
 from sqlmodel import Session as DBSession
 
-from eps.data.models import Contribution, Round, Session, SessionExpert
-from eps.data.repository import Repository
+from eps.data.models import (
+    Contribution,
+    Round,
+    Session,
+    SessionExpert,
+    SessionStatus,
+)
+from eps.data.repository import Repository, SessionDetail
 
 
 @pytest.fixture
@@ -157,3 +163,200 @@ def test_distinct_seq_appends_succeed(repo, engine):
             .order_by(Contribution.seq)
         ).all()
     assert [r.seq for r in rows] == [0, 1]
+
+
+# =========================================================================
+# Story 2.4 — 查詢、刪除與恢復位置（AC-1, AC-2, AC-3, AC-4）
+# =========================================================================
+
+
+def _insert_session(engine, *, topic="t", status=SessionStatus.Created) -> int:
+    """直接插入一筆會話並回傳 id（用於 list/filter 設置，繞過 create_session）。"""
+    with DBSession(engine) as db:
+        session = Session(topic=topic, max_rounds=3, status=status)
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        return session.id
+
+
+def _build_full_session(engine, *, final_report=None) -> dict:
+    """建立含 experts / rounds / contributions / final_report 的完整會話。
+
+    回傳 ``{session_id, round_ids, expert_ids}`` 供斷言使用。回合 1 有 seq 0,1,2；
+    回合 2 有 seq 0,1（用於驗證續跑位置為字典序最大，而非全域最大 seq）。
+    """
+    with DBSession(engine) as db:
+        session = Session(topic="議題", max_rounds=3, status=SessionStatus.Running)
+        if final_report is not None:
+            session.final_report = final_report
+        db.add(session)
+        db.flush()
+
+        experts = [
+            SessionExpert(session_id=session.id, name=n, order_index=i)
+            for i, n in enumerate(["經濟學家", "工程師"])
+        ]
+        rounds = [
+            Round(session_id=session.id, round_number=1),
+            Round(session_id=session.id, round_number=2),
+        ]
+        for obj in experts + rounds:
+            db.add(obj)
+        db.flush()
+
+        # 回合 1：seq 0,1,2；回合 2：seq 0,1
+        for seq in (0, 1, 2):
+            db.add(
+                Contribution(
+                    round_id=rounds[0].id,
+                    session_expert_id=experts[0].id,
+                    seq=seq,
+                    viewpoint=f"r1-{seq}",
+                )
+            )
+        for seq in (0, 1):
+            db.add(
+                Contribution(
+                    round_id=rounds[1].id,
+                    session_expert_id=experts[1].id,
+                    seq=seq,
+                    viewpoint=f"r2-{seq}",
+                )
+            )
+        db.commit()
+        return {
+            "session_id": session.id,
+            "round_ids": [r.id for r in rounds],
+            "expert_ids": [e.id for e in experts],
+        }
+
+
+# --- AC-1：list_sessions 依 created_at desc 並可依 status 過濾 ---
+def test_list_sessions_orders_recent_first(repo, engine):
+    first = _insert_session(engine, topic="A")
+    second = _insert_session(engine, topic="B")
+    third = _insert_session(engine, topic="C")
+
+    sessions = repo.list_sessions()
+
+    # 最近建立優先：以 id 遞減作穩定次序，最新（第三筆）排最前。
+    assert [s.id for s in sessions] == [third, second, first]
+
+
+def test_list_sessions_filters_by_status(repo, engine):
+    _insert_session(engine, status=SessionStatus.Created)
+    running = _insert_session(engine, status=SessionStatus.Running)
+    _insert_session(engine, status=SessionStatus.Completed)
+
+    result = repo.list_sessions(status=SessionStatus.Running)
+
+    assert [s.id for s in result] == [running]
+    assert all(s.status is SessionStatus.Running for s in result)
+
+
+def test_list_sessions_no_match_returns_empty(repo, engine):
+    _insert_session(engine, status=SessionStatus.Created)
+    assert repo.list_sessions(status=SessionStatus.Failed) == []
+
+
+def test_list_sessions_limit_and_offset(repo, engine):
+    ids = [_insert_session(engine, topic=f"S{i}") for i in range(5)]
+    recent_first = list(reversed(ids))
+
+    page = repo.list_sessions(limit=2, offset=1)
+
+    assert [s.id for s in page] == recent_first[1:3]
+
+
+# --- AC-2：get_session_detail 回傳完整聚合 ---
+def test_get_session_detail_aggregates_full_graph(repo, engine):
+    built = _build_full_session(engine, final_report="最終綜整")
+
+    detail = repo.get_session_detail(built["session_id"])
+
+    assert isinstance(detail, SessionDetail)
+    assert detail.session.id == built["session_id"]
+    assert detail.final_report == "最終綜整"
+    # experts 依 order_index、rounds 依 round_number、contributions 依 (round_id, seq)
+    assert [e.order_index for e in detail.experts] == [0, 1]
+    assert [r.round_number for r in detail.rounds] == [1, 2]
+    assert [(c.round_id, c.seq) for c in detail.contributions] == [
+        (built["round_ids"][0], 0),
+        (built["round_ids"][0], 1),
+        (built["round_ids"][0], 2),
+        (built["round_ids"][1], 0),
+        (built["round_ids"][1], 1),
+    ]
+
+
+def test_get_session_detail_final_report_none_by_default(repo, engine):
+    built = _build_full_session(engine)
+    detail = repo.get_session_detail(built["session_id"])
+    assert detail.final_report is None
+
+
+def test_get_session_detail_missing_returns_none(repo):
+    assert repo.get_session_detail(9999) is None
+
+
+# --- AC-3：get_resume_position 回傳字典序最大 (round_number, seq) ---
+def test_get_resume_position_returns_lexicographic_max(repo, engine):
+    built = _build_full_session(engine)
+    # 回合 1 最高 seq=2，回合 2 最高 seq=1；字典序最大為 (2, 1)，非全域最大 seq。
+    assert repo.get_resume_position(built["session_id"]) == (2, 1)
+
+
+def test_get_resume_position_no_contributions_returns_none(repo, engine):
+    # 有會話與回合但無任何發言。
+    with DBSession(engine) as db:
+        session = Session(topic="t", max_rounds=3)
+        db.add(session)
+        db.flush()
+        db.add(Round(session_id=session.id, round_number=1))
+        db.commit()
+        session_id = session.id
+    assert repo.get_resume_position(session_id) is None
+
+
+def test_get_resume_position_missing_session_returns_none(repo):
+    assert repo.get_resume_position(9999) is None
+
+
+# --- AC-4：delete_session 真刪會話與子資料 ---
+def test_delete_session_removes_session_and_children(repo, engine):
+    built = _build_full_session(engine, final_report="x")
+    session_id = built["session_id"]
+
+    assert repo.delete_session(session_id) is True
+
+    # 再查詢找不到。
+    assert repo.get_session_detail(session_id) is None
+    with DBSession(engine) as db:
+        assert db.get(Session, session_id) is None
+        assert (
+            db.exec(
+                select(SessionExpert).where(
+                    SessionExpert.session_id == session_id
+                )
+            ).all()
+            == []
+        )
+        assert (
+            db.exec(
+                select(Round).where(Round.session_id == session_id)
+            ).all()
+            == []
+        )
+        assert (
+            db.exec(
+                select(Contribution).where(
+                    Contribution.round_id.in_(built["round_ids"])
+                )
+            ).all()
+            == []
+        )
+
+
+def test_delete_session_missing_returns_false(repo):
+    assert repo.delete_session(9999) is False

@@ -10,6 +10,9 @@
 Story 2.3 欄位對齊 AC（唯一 schema 建立點，就地修正）：
 ``session_expert.order_index``、``contribution.viewpoint`` 與新增的
 ``contribution.focus_after``。
+
+Story 2.4 就地新增 ``session.final_report``（nullable，1:1 於 session），供
+``get_session_detail`` 聚合回傳；維持五張表，不新增資料表。
 """
 from __future__ import annotations
 
@@ -57,6 +60,8 @@ def upgrade() -> None:
         ),
         sa.Column("max_rounds", sa.Integer(), nullable=False),
         sa.Column("source_url", sqlmodel.sql.sqltypes.AutoString(), nullable=True),
+        # Story 2.4：會話最終綜整報告（nullable，1:1 於 session）。
+        sa.Column("final_report", sqlmodel.sql.sqltypes.AutoString(), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.Column("updated_at", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id"),

@@ -111,6 +111,8 @@ class Session(SQLModel, table=True):
     status: SessionStatus = Field(default=SessionStatus.Created)
     max_rounds: int = Field(ge=MAX_ROUNDS_MIN, le=MAX_ROUNDS_MAX)
     source_url: Optional[str] = Field(default=None)
+    # Story 2.4 / AC-2：會話完成後產出的最終綜整報告（每場會話 1:1，未完成為 None）。
+    final_report: Optional[str] = Field(default=None)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
