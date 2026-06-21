@@ -12,6 +12,7 @@ append-only 保護依賴 ``Contribution`` 的唯一約束 ``(round_id, seq)``：
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import List, Optional, Sequence, Tuple, Union
 
 from sqlalchemy.engine import Engine
@@ -144,6 +145,53 @@ class Repository:
             db.commit()
             db.refresh(contribution)
             return contribution
+
+    def create_round(self, session_id: int, round_number: int) -> Round:
+        """於單一 transaction 建立一個回合里程碑（Story 4.4 / AC-1）。
+
+        對相同 ``(session_id, round_number)`` 重複建立會因唯一約束
+        ``uq_round_session_round_number`` 被資料庫拒絕並拋出 ``IntegrityError``，
+        呼叫端負責處理（不在此吞掉）。
+        """
+        with DBSession(self._engine) as db:
+            rnd = Round(session_id=session_id, round_number=round_number)
+            db.add(rnd)
+            db.commit()
+            db.refresh(rnd)
+            return rnd
+
+    def set_status(self, session_id: int, status: SessionStatus) -> bool:
+        """於單一 transaction 落地會話狀態轉移（Story 4.4 / AC-1）。
+
+        同步更新 ``updated_at``。會話存在並更新成功回傳 ``True``；不存在回傳
+        ``False``（不視為錯誤，供編排層判斷）。
+        """
+        with DBSession(self._engine) as db:
+            session = db.get(Session, session_id)
+            if session is None:
+                return False
+            session.status = status
+            session.updated_at = datetime.now(timezone.utc)
+            db.add(session)
+            db.commit()
+            return True
+
+    def save_final_report(self, session_id: int, report: str) -> bool:
+        """落地最終報告並將狀態轉為 ``Completed``，單一 transaction（Story 4.4 / AC-3）。
+
+        報告與終態狀態在同一 transaction 內原子寫入，避免「有報告卻非完成」或
+        「完成卻無報告」的中間態。會話不存在回傳 ``False``。
+        """
+        with DBSession(self._engine) as db:
+            session = db.get(Session, session_id)
+            if session is None:
+                return False
+            session.final_report = report
+            session.status = SessionStatus.Completed
+            session.updated_at = datetime.now(timezone.utc)
+            db.add(session)
+            db.commit()
+            return True
 
     def list_sessions(
         self,
