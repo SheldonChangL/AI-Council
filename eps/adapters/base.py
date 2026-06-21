@@ -65,6 +65,16 @@ class AuthError(AdapterError):
     """
 
 
+class RetryExhaustedError(AdapterError):
+    """重試耗盡後仍失敗的永久性錯誤（Story 3.4 / AC-2）。
+
+    對暫時性失敗（:class:`TransientError`）與 stall 逾時（:class:`AdapterTimeout`）
+    套用指數退避重試，次數耗盡後拋出此錯誤；落地為 ``SessionStatus.Failed``
+    （藍圖 §4），供編排層終止會話而非 silent 續行（OPS-1）。最後一次的底層失敗
+    保留於 ``__cause__`` 以利診斷。
+    """
+
+
 @runtime_checkable
 class LLMAdapter(Protocol):
     """核心編排依賴的 LLM 後端結構型別（藍圖 §6）。
@@ -104,5 +114,6 @@ __all__ = [
     "AdapterTimeout",
     "TransientError",
     "AuthError",
+    "RetryExhaustedError",
     "LLMAdapter",
 ]

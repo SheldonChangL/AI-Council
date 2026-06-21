@@ -11,6 +11,9 @@ from eps.config import (
     DEFAULT_CLI_PATH,
     DEFAULT_DB_URL,
     DEFAULT_MAX_CONCURRENCY,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+    DEFAULT_STALL_TIMEOUT_SECONDS,
     Settings,
 )
 
@@ -34,6 +37,10 @@ def test_settings_defaults():
     assert settings.cli_path == DEFAULT_CLI_PATH
     assert settings.max_concurrency == DEFAULT_MAX_CONCURRENCY
     assert settings.max_concurrency < 10
+    # Story 3.4：逾時與重試策略預設值。
+    assert settings.stall_timeout_seconds == DEFAULT_STALL_TIMEOUT_SECONDS
+    assert settings.max_retries == DEFAULT_MAX_RETRIES
+    assert settings.retry_backoff_base_seconds == DEFAULT_RETRY_BACKOFF_BASE_SECONDS
 
 
 # AC-2: 環境變數覆寫。
@@ -42,11 +49,17 @@ def test_settings_reads_env_overrides():
         "EPS_DB_URL": "sqlite:////tmp/custom.db",
         "EPS_CLI_PATH": "/usr/local/bin/codex",
         "EPS_MAX_CONCURRENCY": "8",
+        "EPS_STALL_TIMEOUT_SECONDS": "120",
+        "EPS_MAX_RETRIES": "3",
+        "EPS_RETRY_BACKOFF_BASE_SECONDS": "0.5",
     }
     settings = Settings.from_env(environ=env)
     assert settings.db_url == "sqlite:////tmp/custom.db"
     assert settings.cli_path == "/usr/local/bin/codex"
     assert settings.max_concurrency == 8
+    assert settings.stall_timeout_seconds == 120.0
+    assert settings.max_retries == 3
+    assert settings.retry_backoff_base_seconds == 0.5
 
 
 def test_settings_rejects_concurrency_over_limit():
@@ -57,6 +70,22 @@ def test_settings_rejects_concurrency_over_limit():
 def test_settings_rejects_non_integer_concurrency():
     with pytest.raises(ValueError):
         Settings.from_env(environ={"EPS_MAX_CONCURRENCY": "abc"})
+
+
+# Story 3.4：逾時與重試設定的型別與範圍驗證。
+def test_settings_rejects_non_positive_stall_timeout():
+    with pytest.raises(ValueError):
+        Settings.from_env(environ={"EPS_STALL_TIMEOUT_SECONDS": "0"})
+
+
+def test_settings_rejects_negative_max_retries():
+    with pytest.raises(ValueError):
+        Settings.from_env(environ={"EPS_MAX_RETRIES": "-1"})
+
+
+def test_settings_rejects_non_numeric_backoff():
+    with pytest.raises(ValueError):
+        Settings.from_env(environ={"EPS_RETRY_BACKOFF_BASE_SECONDS": "abc"})
 
 
 # AC-3: eps 套件內不得使用相對 import。

@@ -5,6 +5,7 @@ from eps.adapters.base import (
     AdapterTimeout,
     AuthError,
     LLMAdapter,
+    RetryExhaustedError,
     SourceError,
     TransientError,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "LLMAdapter",
     "SourceError",
     "TransientError",
+    "RetryExhaustedError",
     "FakeAdapter",
     "LocalCliAdapter",
 ]

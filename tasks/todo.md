@@ -1,23 +1,36 @@
-# Story 3.3 — LocalCliAdapter 來源驗證與 auth 偵測（validate_source）
+# Story 3.4 — LocalCliAdapter 逾時與重試策略
 
 ## 決策
-- `validate_source()` 既有契約來自 `base.py` Protocol：無效拋 `SourceError`，有效回傳 `None`。沿用，不發明。
-- AC-1（CLI 未安裝）：以 `shutil.which(cli_path)` 偵測執行檔；找不到 → `SourceError`，訊息指示「修復環境／安裝 CLI」。並對 spawn 時的 `FileNotFoundError` 做相同保底。
-- auth 偵測**不發明新 flag/subcommand**：沿用與 `invoke` 完全相同的 `STREAM_JSON_ARGS`，僅以最小 probe prompt 驅動，再依退出碼＋輸出分類。
-- AC-2（非零退出且輸出含 auth/login 關鍵字）：判為 `SourceError`（來源類），**不視為 transient**。重用既有 `_AUTH_MARKERS`，比對 stdout+stderr（AC 措辭為「輸出」）。
-- 非 auth 類非零退出：維持 `TransientError`（與 Story 3.2 一致，可重試），與來源類明確區隔。
-- AC-3（CLI 已安裝且 OAuth 有效）：退出碼 0 → 回傳 `None`（valid）。
-- 重點區分：`validate_source` 的 auth 失敗映射為 `SourceError`（pre-flight 來源類，擋啟動）；`invoke` 的 auth 失敗仍為 `AuthError`（runtime，Story 3.2）。
-- 重構：抽出 `_spawn(prompt)` 共用 spawn+communicate+decode，`_run` 與 `validate_source` 共用，降低重複且不改既有行為。
+- **不發明新契約**：沿用既有例外階層（`TransientError` 可重試、`SourceError`/`AuthError` 不可重試、`AdapterTimeout` 表逾時）。
+- **AC-1（stall 逾時，以「無新輸出」計時）**：`invoke` 的 `_run` 改為**逐行串流**讀 stdout，每次 `readline` 套 `asyncio.wait_for(stall_timeout)`；逾時 → kill 子行程 → 拋 `AdapterTimeout`（被重試流程接住）。計時以「兩行之間」為準，非總時長。
+  - `validate_source` 維持 `_spawn`（communicate，快速 probe，不在 AC-1 範圍），Story 3.3 測試零更動。
+- **AC-2（指數退避，最多 2 次）**：`invoke` 包一層重試迴圈，捕捉 `(TransientError, AdapterTimeout)`；退避 `backoff_base * 2**attempt`；耗盡 → 拋新例外 `RetryExhaustedError`（對應 `SessionStatus.Failed`，藍圖 §4）。
+- **AC-3（SourceError 零重試）**：重試只捕捉 `(TransientError, AdapterTimeout)`；`SourceError`/`AuthError` 不在捕捉集合 → 直接向上拋，零重試。
+- **可注入設定**：`stall_timeout_seconds` / `max_retries` / `retry_backoff_base_seconds` 進 `Settings`（含 env 覆寫與驗證），並可由 `LocalCliAdapter` 建構參數覆寫（與 `cli_path` 一致），讓測試注入小值、避免真實等待。
 
 ## 計畫
-- [x] `eps/adapters/local_cli.py`：`import shutil`；新增 `_VALIDATION_PROBE`；抽出 `_spawn()`；`_run()` 改用 `_spawn()`；新增 `validate_source()`
-- [x] `tests/test_local_cli_validate_source.py`：AC-1 / AC-2 / AC-3 + 非 auth 非零 → Transient 的區隔
-- [x] 驗證：完整 pytest 全綠（136 passed）
+- [x] `eps/adapters/base.py`：新增 `RetryExhaustedError(AdapterError)` + 匯出。
+- [x] `eps/adapters/__init__.py`：匯出 `RetryExhaustedError`。
+- [x] `eps/config.py`：新增 3 設定（預設 240s / 2 / 1.0）+ env 解析 + 驗證。
+- [x] `eps/adapters/local_cli.py`：建構參數；新增串流 `_stream`；`_run` 改用 `_stream`；`invoke` 重試包裝；保留 `_spawn` 給 `validate_source`；更新 docstring。
+- [x] `tests/test_local_cli_adapter.py`：`_FakeProcess` 改為串流介面；transient 測試改為斷言 `RetryExhaustedError`（cause 為 `TransientError`）。
+- [x] `tests/test_local_cli_retry.py`（新）：AC-1 stall / AC-2 退避耗盡 / AC-3 Source 與 Auth 零重試 / 重試後成功。
+- [x] `tests/test_package_skeleton.py`：補新設定的 from_env 解析覆寫與驗證。
+- [x] 驗證：`pytest` 全綠（146 passed）。
 
 ## Review
-- AC-1：`test_missing_cli_raises_source_error`（which→None）驗證 `SourceError` 且訊息含執行檔名與安裝/環境指示；`test_spawn_filenotfound_maps_to_source_error` 驗證 spawn 競態保底。
-- AC-2：`test_auth_failure_raises_source_error_not_transient`（stderr auth）、`test_auth_marker_in_stdout_raises_source_error`（stdout auth）驗證來源類；`test_nonauth_nonzero_raises_transient` 驗證非 auth 非零仍為 `TransientError`，確立來源類 vs transient 的區隔。
-- AC-3：`test_valid_source_returns_none`（退出碼 0）驗證回傳 `None`。
-- 重構 `_spawn()` 抽取後，既有 Story 3.2 測試（invoke 多輪串接 / 旗標 / Transient / Auth）全數維持通過；`LLMAdapter` Protocol 與 `FakeAdapter` 未動。
-- 設計區分：`validate_source` 的 auth 失敗 → `SourceError`（pre-flight 來源類）；`invoke` 的 auth 失敗 → `AuthError`（runtime），兩者不混用。
+- **AC-1（stall 逾時，以「無新輸出」計時）**：`invoke` 改走 `_stream`，對每行 `readline` 套
+  `asyncio.wait_for(stall_timeout)`；逾時 → `proc.kill()` → 拋 `AdapterTimeout`。
+  `test_stall_timeout_retries_then_failed`（永不返回的 `_StallStream`，stall=0.01s）驗證逾時、
+  子行程被 kill、重試 3 次後拋 `RetryExhaustedError`（cause `AdapterTimeout`）；
+  `test_stall_then_success` 驗證逾時後重試成功。
+- **AC-2（指數退避，最多 2 次）**：`test_transient_retries_then_raises_failed` 驗證 3 次嘗試後
+  `RetryExhaustedError`（cause `TransientError`）；`test_exponential_backoff_delays` 驗證退避為
+  `[1.0, 2.0]`；`test_transient_then_success` 驗證重試後成功。
+- **AC-3（SourceError 零重試）**：`test_source_error_not_retried`（僅 1 次嘗試即向上拋）；
+  另補 `test_auth_error_not_retried`（`AuthError` 同屬不可重試，零重試）。
+- **不破壞既有**：`validate_source` 維持 `_spawn`（communicate）→ Story 3.3 測試零更動；Story 3.2
+  測試 fake 升級為串流介面、行為斷言不變；唯一語意調整為 `invoke` 終態錯誤改包成
+  `RetryExhaustedError`（底層分類保留於 `__cause__`），對應測試已同步。
+- **設定可注入**：`stall_timeout_seconds` / `max_retries` / `retry_backoff_base_seconds` 進
+  `Settings`（env 覆寫 + 範圍驗證）並可由建構參數覆寫，測試以小值注入避免真實等待。
