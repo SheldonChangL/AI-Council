@@ -90,7 +90,8 @@ class OrchestrationEngine:
     ) -> SessionRuntime:
         """執行一場會話的完整編排，回傳終態的 :class:`SessionRuntime`。
 
-        來源驗證失敗（:class:`SourceError`）時轉為 ``SourceInvalid`` 並提前結束；
+        來源 pre-flight 驗證失敗（:class:`SourceError`）時轉為 ``SourceInvalid``、
+        發出 ``SessionFailed``（含重新登入提示）並提前結束；
         正常跑完 ``max_rounds`` 後落地最終報告並轉為 ``Completed``。
 
         失敗與取消路徑（Story 4.5 / FR-14, OPS-1, OPS-2）——皆保留已落地的
@@ -111,7 +112,10 @@ class OrchestrationEngine:
         try:
             await self._adapter.validate_source(runtime.source_url or "")
         except SourceError:
-            await self._transition(runtime, SessionStatus.SourceInvalid)
+            # 來源 pre-flight 失效：與「執行中來源失效」一致，落地 SourceInvalid 並對外
+            # 發 SessionFailed（含「重新登入後重試」提示、partialAvailable），使 client
+            # 明確收到終止信號而非空等偽造的成功報告（Story 5.6 AC-3 / OPS-1）。
+            await self._fail(runtime, SessionStatus.SourceInvalid, SOURCE_INVALID_REASON)
             return runtime
 
         # --- 進入執行（StatusChanged(Running)）---
