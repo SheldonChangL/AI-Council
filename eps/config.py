@@ -26,6 +26,10 @@ DEFAULT_STALL_TIMEOUT_SECONDS = 240.0
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_BACKOFF_BASE_SECONDS = 1.0
 
+# Story 4.3 / FR-10 / 藍圖 §3.3：焦點字串長度上限（字元數）。
+# 多輪累積的焦點若超過此上限即壓縮，避免超出模型脈絡上限。
+DEFAULT_MAX_FOCUS_CHARS = 4000
+
 
 def _env_int(env: Mapping[str, str], key: str, default: int) -> int:
     """讀取整數環境變數；缺漏套用 ``default``，非整數則拋 ``ValueError``。"""
@@ -59,6 +63,7 @@ class Settings:
     - ``EPS_STALL_TIMEOUT_SECONDS``：stall 逾時 soft cap（秒），須 > 0（Story 3.4）。
     - ``EPS_MAX_RETRIES``：暫時性失敗的最多重試次數，須 ≥ 0（Story 3.4）。
     - ``EPS_RETRY_BACKOFF_BASE_SECONDS``：指數退避基數（秒），須 ≥ 0（Story 3.4）。
+    - ``EPS_MAX_FOCUS_CHARS``：焦點字串長度上限（字元數），須 > 0（Story 4.3）。
     """
 
     db_url: str = DEFAULT_DB_URL
@@ -67,6 +72,7 @@ class Settings:
     stall_timeout_seconds: float = DEFAULT_STALL_TIMEOUT_SECONDS
     max_retries: int = DEFAULT_MAX_RETRIES
     retry_backoff_base_seconds: float = DEFAULT_RETRY_BACKOFF_BASE_SECONDS
+    max_focus_chars: int = DEFAULT_MAX_FOCUS_CHARS
 
     def __post_init__(self) -> None:
         if not 1 <= self.max_concurrency < MAX_CONCURRENCY_LIMIT:
@@ -84,6 +90,10 @@ class Settings:
             raise ValueError(
                 "retry_backoff_base_seconds 必須 ≥ 0，得到 "
                 f"{self.retry_backoff_base_seconds}"
+            )
+        if self.max_focus_chars <= 0:
+            raise ValueError(
+                f"max_focus_chars 必須 > 0，得到 {self.max_focus_chars}"
             )
 
     @classmethod
@@ -114,6 +124,9 @@ class Settings:
                 env,
                 "EPS_RETRY_BACKOFF_BASE_SECONDS",
                 DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+            ),
+            max_focus_chars=_env_int(
+                env, "EPS_MAX_FOCUS_CHARS", DEFAULT_MAX_FOCUS_CHARS
             ),
         )
 
