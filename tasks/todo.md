@@ -1,34 +1,33 @@
-# Story 5.2 — POST /sessions 建立會話、驗證並排程背景任務（FR-1, FR-3, OPS-3 / 藍圖 A1）
+# Story 5.3 — 取消與重試端點（FR-14, OPS-2 / 藍圖 A4/A5）
 
 ## 背景
-- DTO（`CreateSessionRequest` 等）已由 Story 5.1 完成；`JobManager` 已由 Story 4.6 完成。
-- 本 story 為整合：新增 `POST /sessions` 端點、把 `JobManager` 接進 app，並補上 idempotency。
+- `JobManager.cancel` / `.start`（Story 4.6）與引擎取消／失敗路徑（Story 4.5）已完成。
+- 本 story 為整合：新增 `POST /sessions/{id}/cancel` 與 `POST /sessions/{id}/retry` 兩端點。
 
 ## 設計決策
-- **回應形狀**：AC-1 明定 `{sessionId, status:"Created"}`，覆寫 5.1 的 `CreateSessionResponse`（保留不動）。新增精簡 DTO `CreateSessionAccepted`。
-- **錯誤碼分流**：端點內手動 `model_validate`，攔 `ValidationError`：
-  - experts 超過上限（`too_long` on `experts`）→ 400 `TOO_MANY_EXPERTS`（AC-3）。
-  - 其餘（topic 空、maxRounds 越界、experts 空…）→ 422 `INVALID_INPUT`（AC-2）。
-  - 採端點內處理而非全域 handler，避免影響其他端點既有行為。
-- **Idempotency**：在 `session` 新增 nullable + unique 的 `idempotency_key` 欄位（沿用 final_report/usage_stats 的 nullable 欄位先例，不新增資料表）；DB 唯一約束作為併發 backstop。
-- **背景排程**：lifespan 組裝 `EventBus` + `OrchestrationEngine` + `JobManager` 放 `app.state.job_manager`；端點以 `get_job_manager` 依賴注入，測試可覆寫成 stub 避免真實 CLI。端點為 `async def`，使 `JobManager.start`（`create_task`）有運行中 loop。
+- **狀態集合**：在 `models.py` 定義 `TERMINAL_STATUSES`（Completed/Failed/SourceInvalid/Cancelled）與 `RETRYABLE_STATUSES`（SourceInvalid/Failed），作為端點判定的單一真相來源。
+- **端點權威落地**：端點直接 `set_status` 落地目標狀態（cancel→Cancelled、retry→ValidatingSource），使回應與 DB 立即一致；背景引擎的取消／重跑為冪等收斂。即便背景把手已遺失（多程序／重啟、`JobManager.cancel` 回 False），仍以 DB 為權威記錄使用者意圖。
+- **cancel**：非終態 → signal 取消旗標 + 落地 Cancelled → 200 `{status:"Cancelled"}`；終態 → 409 `NOT_CANCELLABLE`；不存在 → 404 `SESSION_NOT_FOUND`。
+- **retry**：失敗終態（SourceInvalid/Failed）→ 落地 ValidatingSource + `jobs.start` 重新排程 → 202 `{status:"ValidatingSource"}`；其餘狀態（含 Completed）→ 409 `NOT_RETRYABLE`（嚴格依 AC-2 列舉可重試集合，不臆造其他狀態語意）；不存在 → 404。
+- **輕量讀取**：新增 `Repository.get_session`，僅讀會話本體判定狀態（不載入聚合）。
+- **DTO**：新增 `SessionStatusOut`（`{status}`），cancel/retry 共用。
 
 ## 待辦
-- [x] models.py：Session 新增 `idempotency_key`（nullable, unique index）
-- [x] migrations/0004_idempotency_key.py：add column + unique index
-- [x] repository.py：`create_session(..., idempotency_key=None)` + `find_session_by_idempotency_key`
-- [x] schemas.py：新增 `CreateSessionAccepted`
-- [x] routes.py：`get_job_manager` + `POST /sessions`
-- [x] main.py：lifespan 組裝並注入 `job_manager`
-- [x] tests：POST /sessions AC-1~4；migration head 版本 + 新欄位；repository idempotency
-- [x] ruff（本次檔案全綠）+ pytest 全綠（236 passed）+ CI 等效煙霧測試
+- [x] models.py：`TERMINAL_STATUSES` / `RETRYABLE_STATUSES`
+- [x] repository.py：`get_session`
+- [x] schemas.py：`SessionStatusOut`
+- [x] routes.py：`POST /sessions/{id}/cancel`、`POST /sessions/{id}/retry` + 409 helpers
+- [x] tests：cancel/retry AC-1~AC-3、404、非終態/非可重試矩陣；repository `get_session`
+- [x] ruff（本次檔案全綠）+ pytest 全綠（254 passed）
 
 ## Review
-- **AC-1**：`test_create_session_returns_202_and_schedules_job`——合法 payload 回 202 `{sessionId, status:"Created"}`，stub JobManager 記錄 `start(sessionId)`（背景任務已排程、與 HTTP 解耦），會話與專家落地。背景任務進入 ValidatingSource gate 屬引擎職責（`test_core_engine` 已涵蓋），API 層僅驗證已排程。
-- **AC-2**：`test_create_session_invalid_max_rounds_returns_422`（0/21）與 `test_create_session_blank_topic_returns_422`（""/"  "）——皆回 422 `INVALID_INPUT` 且未排程。端點內 `model_validate` 攔 `ValidationError` 經 `_validation_error` 分流。
-- **AC-3**：`test_create_session_too_many_experts_returns_400`——experts 超過 `EXPERTS_MAX(8)` 回 400 `TOO_MANY_EXPERTS`（依 Pydantic `too_long` on `experts` 分流），未排程。
-- **AC-4**：`test_create_session_idempotent_returns_same_session_id`——相同 `Idempotency-Key` 重播回同一 sessionId 且僅排程一次；`..._distinct_keys_...` 不同鍵建立不同會話。Repository 層 `test_find_session_by_idempotency_key_roundtrip` / `..._duplicate_key_violates_unique` / `..._null_keys_do_not_collide` 驗證持久層與唯一約束（含併發 backstop：`IntegrityError` → 回查）。
-- **migration**：head 更新為 `0004_idempotency_key`；新增欄位 nullable + unique 索引測試。CI（migrate→pytest→uvicorn /health smoke）等效本機驗證通過：alembic upgrade head + app boot + POST 202 + 冪等重播一致。
-- **設計備註**：回應採新 DTO `CreateSessionAccepted`（AC-1 明定 `{sessionId,status}`，與 5.1 `CreateSessionResponse` 並存、後者保留）。錯誤分流採端點內處理而非全域 handler，零副作用於其他端點。idempotency 沿用 nullable 欄位先例、不新增資料表。
-- **既有狀況**：`test_core_bus.py` 1 個既有 ruff F401（HEAD 已存在，非本次引入）；CI 不 gate ruff，不受影響。
-- **已知限制 / Tester 重點**：背景任務排程後的真實 CLI 執行不在 API 測試覆蓋（以 stub 隔離）；端到端研討由 `test_integration_full_session` 涵蓋。多程序部署下 in-memory JobManager 與冪等 in-process 競態保護不適用（本系統為單程序 asyncio 模型），DB 唯一約束為跨程序 backstop。
+- **AC-1**：`test_cancel_running_session_returns_200_cancelled` — Running → 200 `{status:"Cancelled"}`，signal 取消旗標且 DB 落地 Cancelled。`test_cancel_non_terminal_states_are_cancellable`（Created/ValidatingSource）同樣可取消。`test_cancel_terminal_session_returns_409`（Completed/Failed/SourceInvalid/Cancelled）→ 409 `NOT_CANCELLABLE`，不 signal、狀態不變。
+- **AC-2**：`test_retry_failed_session_returns_202_validating`（SourceInvalid/Failed）→ 202 `{status:"ValidatingSource"}`，已 `jobs.start` 重新排程且 DB 落地 ValidatingSource。
+- **AC-3**：`test_retry_completed_session_returns_409` — Completed → 409 `NOT_RETRYABLE`，不重排。`test_retry_non_retryable_states_return_409`（Created/ValidatingSource/Running/Cancelled）同樣 409。
+- **邊界**：`test_cancel_missing_session_returns_404` / `test_retry_missing_session_returns_404` → 404 `SESSION_NOT_FOUND`。
+- **既有狀況**：`test_core_bus.py` 1 個既有 ruff F401（HEAD 已存在，非本次引入）。
+
+## 已知限制 / Tester 重點
+- API 層以 stub JobManager 隔離，未驅動真實背景任務／CLI（沿用 Story 5.2 模式）。
+- **retry 重跑的引擎續跑**：SourceInvalid（驗證前失敗、無 rounds）重跑乾淨。Failed 若已落地部分 rounds，現行引擎 `run` 從 round 1 重建會撞 `uq_round_session_round_number` 唯一約束（引擎尚未使用 `get_resume_position` 續跑）。此為引擎 resume 能力缺口（屬另一 story），非本端點 story 範圍；端點已正確重設狀態並重排。建議交付 Architect/後續 resume story 處理。
+- 多程序部署下 in-memory JobManager 取消 signal 僅及本程序；DB 落地 Cancelled 為跨程序權威記錄。

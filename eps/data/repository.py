@@ -130,6 +130,15 @@ class Repository:
                 return template.system_prompt
         return ""
 
+    def get_session(self, session_id: int) -> Optional[Session]:
+        """依 id 取得會話本體；不存在回傳 ``None``（Story 5.3 cancel/retry）。
+
+        取消/重試端點僅需讀取會話當前 ``status`` 以判定可否轉移，故提供此輕量讀取
+        （不載入 experts/rounds/contributions，有別於 :meth:`get_session_detail`）。
+        """
+        with DBSession(self._engine) as db:
+            return db.get(Session, session_id)
+
     def find_session_by_idempotency_key(self, key: str) -> Optional[Session]:
         """依冪等鍵查既有會話；不存在回傳 ``None``（Story 5.2 / AC-4）。
 

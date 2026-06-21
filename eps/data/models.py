@@ -53,6 +53,25 @@ class SessionStatus(str, Enum):
     Cancelled = "Cancelled"
 
 
+# Story 5.3 / 藍圖 §3.2：狀態機的終態與可重試集合，供取消/重試端點判定（FR-14, OPS-2）。
+# - 終態（不再自行轉移）：``Completed`` / ``Failed`` / ``SourceInvalid`` / ``Cancelled``。
+#   取消僅對非終態（``Created`` / ``ValidatingSource`` / ``Running``）有效；對終態回
+#   409 ``NOT_CANCELLABLE``（AC-1）。
+# - 可重試（失敗終態，保有部分結果可續跑）：``SourceInvalid`` / ``Failed``（AC-2）。
+#   其餘狀態（含成功終態 ``Completed``）重試回 409 ``NOT_RETRYABLE``（AC-3）。
+TERMINAL_STATUSES = frozenset(
+    {
+        SessionStatus.Completed,
+        SessionStatus.Failed,
+        SessionStatus.SourceInvalid,
+        SessionStatus.Cancelled,
+    }
+)
+RETRYABLE_STATUSES = frozenset(
+    {SessionStatus.SourceInvalid, SessionStatus.Failed}
+)
+
+
 class PersonaTemplate(SQLModel, table=True):
     """可重用的專家人設範本。
 
@@ -204,6 +223,8 @@ class Contribution(SQLModel, table=True):
 
 __all__ = [
     "SessionStatus",
+    "TERMINAL_STATUSES",
+    "RETRYABLE_STATUSES",
     "PersonaTemplate",
     "Session",
     "SessionExpert",

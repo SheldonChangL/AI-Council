@@ -468,3 +468,20 @@ def test_delete_session_removes_session_and_children(repo, engine):
 
 def test_delete_session_missing_returns_false(repo):
     assert repo.delete_session(9999) is False
+
+
+# --- Story 5.3：get_session 輕量讀取會話本體（cancel/retry 判定狀態用）---
+def test_get_session_returns_row_with_status(repo):
+    created = repo.create_session(
+        topic="議題", max_rounds=3, experts=["E0"]
+    )
+    repo.set_status(created.id, SessionStatus.Running)
+
+    fetched = repo.get_session(created.id)
+    assert fetched is not None
+    assert fetched.id == created.id
+    assert fetched.status == SessionStatus.Running
+
+
+def test_get_session_missing_returns_none(repo):
+    assert repo.get_session(9999) is None
