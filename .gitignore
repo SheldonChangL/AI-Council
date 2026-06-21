@@ -4,6 +4,11 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
+# SQLite 產物（含 WAL / shared-memory 檔）
+*.db
+*.db-wal
+*.db-shm
+
 # Virtual env
 .venv/
 
