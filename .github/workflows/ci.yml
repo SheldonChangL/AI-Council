@@ -1,0 +1,57 @@
+name: CI
+
+# Story 1.4 — 乾淨環境整合 gate：install → migrate → 完整 test suite → 啟動 smoke。
+# 任一步驟失敗則 job 失敗。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: install / migrate / test / smoke
+    runs-on: ubuntu-latest
+    env:
+      # CI 使用獨立 SQLite 檔，避免污染並與本機設定一致。
+      EPS_DB_URL: "sqlite:///./ci.db"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      # 步驟 1：安裝（含 dev 依賴）。
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # 步驟 2：建庫（套用所有 migration 到 head）。
+      - name: Apply migrations
+        run: uv run alembic upgrade head
+
+      # 步驟 3：完整測試套件（非僅 lint）。
+      - name: Run test suite
+        run: uv run pytest
+
+      # 步驟 4：Uvicorn 啟動 smoke — 啟動服務並確認 /health 回 200。
+      - name: Uvicorn startup smoke
+        run: |
+          uv run uvicorn eps.main:app --port 8723 &
+          UVICORN_PID=$!
+          trap 'kill "$UVICORN_PID" 2>/dev/null || true' EXIT
+
+          for attempt in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8723/health || true)
+            if [ "$code" = "200" ]; then
+              echo "health OK on attempt $attempt"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "health check did not return 200 within timeout" >&2
+          exit 1
