@@ -60,6 +60,7 @@ class SessionRuntime:
 
     承載引擎推進所需的最小可變狀態：``status`` 重用持久層狀態機、``experts`` 為
     開跑時固定的參與專家、``current_round`` 為正在進行的回合（尚未開始為 ``None``）。
+    ``source_url`` 對應 ``Session.source_url``，供來源驗證階段使用（None 表無來源）。
     """
 
     session_id: int
@@ -68,6 +69,7 @@ class SessionRuntime:
     experts: List[ExpertRef] = field(default_factory=list)
     status: SessionStatus = SessionStatus.Created
     current_round: Optional[RoundState] = None
+    source_url: Optional[str] = None
 
 
 __all__ = [
