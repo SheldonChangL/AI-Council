@@ -117,6 +117,10 @@ class Session(SQLModel, table=True):
     status: SessionStatus = Field(default=SessionStatus.Created)
     max_rounds: int = Field(ge=MAX_ROUNDS_MIN, le=MAX_ROUNDS_MAX)
     source_url: Optional[str] = Field(default=None)
+    # Story 5.2 / AC-4：選用的冪等鍵（Idempotency-Key）。帶相同鍵的重複 `POST /sessions`
+    # 須回傳同一會話，故以 unique 索引保證每個鍵至多對應一場會話（併發 backstop）。
+    # nullable：未帶鍵建立的會話為 NULL，SQLite 視多個 NULL 為相異，互不衝突。
+    idempotency_key: Optional[str] = Field(default=None, index=True, unique=True)
     # Story 2.4 / AC-2：會話完成後產出的最終綜整報告（每場會話 1:1，未完成為 None）。
     final_report: Optional[str] = Field(default=None)
     # Story 4.6 / OPS-3：會話結束後彙總的用量統計（輪次×專家用量），以 JSON 文字

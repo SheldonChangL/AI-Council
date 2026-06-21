@@ -1,23 +1,34 @@
-# Story 4.6 — 背景任務生命週期、併發 semaphore 與用量統計（FR-13 / NFR-4 / OPS-3）
+# Story 5.2 — POST /sessions 建立會話、驗證並排程背景任務（FR-1, FR-3, OPS-3 / 藍圖 A1）
 
-## 決策
-- **JobManager 自包含**：注入 `engine` / `repo` / `bus`，持有全域 `asyncio.Semaphore(max_concurrency)`。`start(session_id)` 以 `asyncio.create_task` 建背景任務並**立即回傳** `JobHandle`，與 HTTP 連線解耦（AC-1）。HTTP/transport 層的接線留待後續 story（本 story 為 prereq，僅建機制）。
-- **併發閘門**：semaphore 在背景任務內、`engine.run()` **外圈** acquire，故等待名額時 in-flight 引擎（→CLI 子行程）數不超過上限，超出者排隊（AC-2）。每個 job 各自 `JobHandle` + `cancel_token`，狀態互不污染。
-- **用量持久化沿用 Story 2.4 先例**：在 `session` 新增 nullable `usage_stats`（JSON 文字）欄位，**不新增資料表**。用量由會話結束後的 `get_session_detail` 彙總（rounds / experts / contributions ＋每位專家發言數）。
-- **僅監測不中止（OPS-3）**：用量統計在 `_run_job` 的 `finally` 區塊執行，成功/失敗/取消路徑皆發佈 `UsageStats` 事件並持久化；統計自身失敗只 log、絕不影響會話結果。
+## 背景
+- DTO（`CreateSessionRequest` 等）已由 Story 5.1 完成；`JobManager` 已由 Story 4.6 完成。
+- 本 story 為整合：新增 `POST /sessions` 端點、把 `JobManager` 接進 app，並補上 idempotency。
 
-## 計畫
-- [x] `eps/data/models.py`：`Session` 新增 `usage_stats: Optional[str] = None`（nullable JSON 文字）。
-- [x] `migrations/versions/0003_usage_stats.py`：`session` 新增 `usage_stats` 欄位（nullable）。
-- [x] `eps/data/repository.py`：新增 `save_usage_stats(session_id, usage_stats_json)`（單 transaction 落地）。
-- [x] `eps/core/jobs.py`：`JobState` / `JobHandle` / `compute_usage` / `JobManager`（start / status / cancel / 背景任務 + semaphore + 用量發佈）。
-- [x] `tests/test_core_jobs.py`：AC-1 立即回傳與狀態查詢 / AC-2 semaphore 上限＋會話隔離 / AC-3 用量發佈＋持久化（含失敗路徑僅監測不中止）。
-- [x] `tests/test_migrations.py`：head 更新為 `0003_usage_stats`，新增 `session.usage_stats` 欄位測試。
-- [x] 驗證：`uv run pytest` 全綠（206 passed）；CI 僅 gate pytest。
+## 設計決策
+- **回應形狀**：AC-1 明定 `{sessionId, status:"Created"}`，覆寫 5.1 的 `CreateSessionResponse`（保留不動）。新增精簡 DTO `CreateSessionAccepted`。
+- **錯誤碼分流**：端點內手動 `model_validate`，攔 `ValidationError`：
+  - experts 超過上限（`too_long` on `experts`）→ 400 `TOO_MANY_EXPERTS`（AC-3）。
+  - 其餘（topic 空、maxRounds 越界、experts 空…）→ 422 `INVALID_INPUT`（AC-2）。
+  - 採端點內處理而非全域 handler，避免影響其他端點既有行為。
+- **Idempotency**：在 `session` 新增 nullable + unique 的 `idempotency_key` 欄位（沿用 final_report/usage_stats 的 nullable 欄位先例，不新增資料表）；DB 唯一約束作為併發 backstop。
+- **背景排程**：lifespan 組裝 `EventBus` + `OrchestrationEngine` + `JobManager` 放 `app.state.job_manager`；端點以 `get_job_manager` 依賴注入，測試可覆寫成 stub 避免真實 CLI。端點為 `async def`，使 `JobManager.start`（`create_task`）有運行中 loop。
+
+## 待辦
+- [x] models.py：Session 新增 `idempotency_key`（nullable, unique index）
+- [x] migrations/0004_idempotency_key.py：add column + unique index
+- [x] repository.py：`create_session(..., idempotency_key=None)` + `find_session_by_idempotency_key`
+- [x] schemas.py：新增 `CreateSessionAccepted`
+- [x] routes.py：`get_job_manager` + `POST /sessions`
+- [x] main.py：lifespan 組裝並注入 `job_manager`
+- [x] tests：POST /sessions AC-1~4；migration head 版本 + 新欄位；repository idempotency
+- [x] ruff（本次檔案全綠）+ pytest 全綠（236 passed）+ CI 等效煙霧測試
 
 ## Review
-- **AC-1**：`test_start_returns_immediately_and_is_queryable`——`start()` 回傳把手時背景任務尚未完成（`task.done()` 為 False，與呼叫端解耦），`status()` 立即可查；放行後 `Finished` 並反映會話終態。`test_status_none_for_unknown_session` 未啟動回 None；`test_start_is_idempotent_while_in_flight` 進行中重複 start 回同一把手、不重複啟動。
-- **AC-2**：`test_semaphore_caps_in_flight_and_queues_excess`——上限 2、啟動 5 個，in-flight 引擎數恆為 2、超出者 `Pending` 排隊；放行後全程峰值不超過上限且 5 個全部完成。`test_cancel_one_session_does_not_pollute_others`——僅取消 s1，s2 取消旗標未被 set，終態 s1=Cancelled、s2=Completed（狀態互不污染）。
-- **AC-3**：`test_usage_published_and_persisted_on_completion`——2 輪×2 專家發佈 `UsageStats`（rounds=2/experts=2/contributions=4 ＋每位專家 2 次），`session.usage_stats` 持久化且與事件一致，終態仍為 Completed。`test_usage_published_on_failure_without_aborting`——失敗路徑仍發佈/持久化部分用量（contributions=1），會話維持 Failed、不臆造報告（僅監測不中止）。`test_compute_usage_counts_per_expert` 直接驗證純函式彙總。
-- **設計備註 / 範圍**：JobManager 為自包含單元（注入 engine/repo/bus），未接線 FastAPI——HTTP/transport 啟動端點與 app 層 EventBus 屬後續 story（本 story 為 prereq，僅建機制）。用量持久化沿用 Story 2.4 `final_report` 的 nullable 欄位先例，維持五張表、不新增資料表。
-- **既有狀況**：`test_core_bus.py` / 另一測試檔有 2 個既有 ruff F401（在 HEAD 已存在，非本次引入）；CI 僅 gate `uv run pytest`，不受影響。依最小變更原則未一併修改。
+- **AC-1**：`test_create_session_returns_202_and_schedules_job`——合法 payload 回 202 `{sessionId, status:"Created"}`，stub JobManager 記錄 `start(sessionId)`（背景任務已排程、與 HTTP 解耦），會話與專家落地。背景任務進入 ValidatingSource gate 屬引擎職責（`test_core_engine` 已涵蓋），API 層僅驗證已排程。
+- **AC-2**：`test_create_session_invalid_max_rounds_returns_422`（0/21）與 `test_create_session_blank_topic_returns_422`（""/"  "）——皆回 422 `INVALID_INPUT` 且未排程。端點內 `model_validate` 攔 `ValidationError` 經 `_validation_error` 分流。
+- **AC-3**：`test_create_session_too_many_experts_returns_400`——experts 超過 `EXPERTS_MAX(8)` 回 400 `TOO_MANY_EXPERTS`（依 Pydantic `too_long` on `experts` 分流），未排程。
+- **AC-4**：`test_create_session_idempotent_returns_same_session_id`——相同 `Idempotency-Key` 重播回同一 sessionId 且僅排程一次；`..._distinct_keys_...` 不同鍵建立不同會話。Repository 層 `test_find_session_by_idempotency_key_roundtrip` / `..._duplicate_key_violates_unique` / `..._null_keys_do_not_collide` 驗證持久層與唯一約束（含併發 backstop：`IntegrityError` → 回查）。
+- **migration**：head 更新為 `0004_idempotency_key`；新增欄位 nullable + unique 索引測試。CI（migrate→pytest→uvicorn /health smoke）等效本機驗證通過：alembic upgrade head + app boot + POST 202 + 冪等重播一致。
+- **設計備註**：回應採新 DTO `CreateSessionAccepted`（AC-1 明定 `{sessionId,status}`，與 5.1 `CreateSessionResponse` 並存、後者保留）。錯誤分流採端點內處理而非全域 handler，零副作用於其他端點。idempotency 沿用 nullable 欄位先例、不新增資料表。
+- **既有狀況**：`test_core_bus.py` 1 個既有 ruff F401（HEAD 已存在，非本次引入）；CI 不 gate ruff，不受影響。
+- **已知限制 / Tester 重點**：背景任務排程後的真實 CLI 執行不在 API 測試覆蓋（以 stub 隔離）；端到端研討由 `test_integration_full_session` 涵蓋。多程序部署下 in-memory JobManager 與冪等 in-process 競態保護不適用（本系統為單程序 asyncio 模型），DB 唯一約束為跨程序 backstop。

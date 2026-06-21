@@ -175,6 +175,17 @@ class CreateSessionResponse(_CamelModel):
     experts: List[ExpertOut]
 
 
+class CreateSessionAccepted(_CamelModel):
+    """`POST /sessions` 已受理回應（Story 5.2 / AC-1）。
+
+    AC-1 明定形狀為 `{sessionId, status:"Created"}`：會話已落地、背景任務已排程
+    （將進入 ``ValidatingSource`` gate），HTTP 即以 202 回此精簡確認，與背景處理解耦。
+    """
+
+    session_id: int
+    status: SessionStatus
+
+
 class SourceStatusOut(_CamelModel):
     """`GET /source/status` 回應（Story 3.5 / FR-4, OPS-1）。
 
@@ -200,5 +211,6 @@ __all__ = [
     "ExpertIn",
     "CreateSessionRequest",
     "CreateSessionResponse",
+    "CreateSessionAccepted",
     "SourceStatusOut",
 ]
