@@ -110,6 +110,18 @@ class SessionDetailOut(_CamelModel):
         )
 
 
+class SourceStatusOut(_CamelModel):
+    """`GET /source/status` 回應（Story 3.5 / FR-4, OPS-1）。
+
+    ``valid`` 由 ``LLMAdapter.validate_source()`` 真實判定：正常返回即 ``True``；
+    拋出 ``SourceError``（或其他 ``AdapterError``）即 ``False``，``reason`` 帶
+    錯誤訊息（含修復／重新登入提示）。``valid=True`` 時 ``reason`` 為 ``None``。
+    """
+
+    valid: bool
+    reason: Optional[str] = None
+
+
 __all__ = [
     "SessionSummary",
     "PersonaOut",
@@ -118,4 +130,5 @@ __all__ = [
     "RoundOut",
     "ContributionOut",
     "SessionDetailOut",
+    "SourceStatusOut",
 ]
