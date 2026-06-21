@@ -1,33 +1,35 @@
-# Story 5.3 — 取消與重試端點（FR-14, OPS-2 / 藍圖 A4/A5）
+# Story 6.2 — CLI WebSocket 串流進度顯示（FR-12, FR-11, OPS-1）
 
-## 背景
-- `JobManager.cancel` / `.start`（Story 4.6）與引擎取消／失敗路徑（Story 4.5）已完成。
-- 本 story 為整合：新增 `POST /sessions/{id}/cancel` 與 `POST /sessions/{id}/retry` 兩端點。
+## 計畫
+- [ ] `eps/cli/progress.py`：新增 `ProgressRenderer`，以 Rich 渲染單則事件
+      - RoundStarted/ExpertStarted → 輪次與發言中專家（AC-1）
+      - RoundSummary/ReportCompleted → 輪次總結與「報告完成」（AC-2）
+      - SessionFailed → 失敗原因＋是否有部分結果，不偽裝成功（AC-3）
+      - `handle()` 回傳是否為終態；終態旗標 `completed` / `failed`
+- [ ] `eps/cli/client.py`：新增 `stream_events()` context manager
+      - 注入路徑（TestClient `websocket_connect`）與生產路徑（websockets sync）雙支援
+      - 連線被拒（404）統一拋 `WatchConnectionError`
+- [ ] `eps/cli/main.py`：新增 `watch` 子命令，串接 client + renderer，失敗 exit 1
+- [ ] 測試
+      - `tests/test_cli_progress.py`：renderer 單元測試（AC-1/2/3）
+      - `tests/test_cli_watch.py`：watch 端到端（TestClient 注入，gated adapter）＋未知會話
 
-## 設計決策
-- **狀態集合**：在 `models.py` 定義 `TERMINAL_STATUSES`（Completed/Failed/SourceInvalid/Cancelled）與 `RETRYABLE_STATUSES`（SourceInvalid/Failed），作為端點判定的單一真相來源。
-- **端點權威落地**：端點直接 `set_status` 落地目標狀態（cancel→Cancelled、retry→ValidatingSource），使回應與 DB 立即一致；背景引擎的取消／重跑為冪等收斂。即便背景把手已遺失（多程序／重啟、`JobManager.cancel` 回 False），仍以 DB 為權威記錄使用者意圖。
-- **cancel**：非終態 → signal 取消旗標 + 落地 Cancelled → 200 `{status:"Cancelled"}`；終態 → 409 `NOT_CANCELLABLE`；不存在 → 404 `SESSION_NOT_FOUND`。
-- **retry**：失敗終態（SourceInvalid/Failed）→ 落地 ValidatingSource + `jobs.start` 重新排程 → 202 `{status:"ValidatingSource"}`；其餘狀態（含 Completed）→ 409 `NOT_RETRYABLE`（嚴格依 AC-2 列舉可重試集合，不臆造其他狀態語意）；不存在 → 404。
-- **輕量讀取**：新增 `Repository.get_session`，僅讀會話本體判定狀態（不載入聚合）。
-- **DTO**：新增 `SessionStatusOut`（`{status}`），cancel/retry 共用。
-
-## 待辦
-- [x] models.py：`TERMINAL_STATUSES` / `RETRYABLE_STATUSES`
-- [x] repository.py：`get_session`
-- [x] schemas.py：`SessionStatusOut`
-- [x] routes.py：`POST /sessions/{id}/cancel`、`POST /sessions/{id}/retry` + 409 helpers
-- [x] tests：cancel/retry AC-1~AC-3、404、非終態/非可重試矩陣；repository `get_session`
-- [x] ruff（本次檔案全綠）+ pytest 全綠（254 passed）
+## 完成
+- [x] `eps/cli/progress.py`：`ProgressRenderer`（AC-1/2/3，動態內容不經 markup）
+- [x] `eps/cli/client.py`：`stream_events()` + `WatchConnectionError`（TestClient／websockets 雙路徑）
+- [x] `eps/cli/main.py`：`watch` 子命令，SessionFailed → exit 1
+- [x] `tests/test_cli_progress.py`（7）、`tests/test_cli_watch.py`（3）
+- [x] pytest 全綠（282 passed）、ruff `eps/cli` 與新測試全綠
 
 ## Review
-- **AC-1**：`test_cancel_running_session_returns_200_cancelled` — Running → 200 `{status:"Cancelled"}`，signal 取消旗標且 DB 落地 Cancelled。`test_cancel_non_terminal_states_are_cancellable`（Created/ValidatingSource）同樣可取消。`test_cancel_terminal_session_returns_409`（Completed/Failed/SourceInvalid/Cancelled）→ 409 `NOT_CANCELLABLE`，不 signal、狀態不變。
-- **AC-2**：`test_retry_failed_session_returns_202_validating`（SourceInvalid/Failed）→ 202 `{status:"ValidatingSource"}`，已 `jobs.start` 重新排程且 DB 落地 ValidatingSource。
-- **AC-3**：`test_retry_completed_session_returns_409` — Completed → 409 `NOT_RETRYABLE`，不重排。`test_retry_non_retryable_states_return_409`（Created/ValidatingSource/Running/Cancelled）同樣 409。
-- **邊界**：`test_cancel_missing_session_returns_404` / `test_retry_missing_session_returns_404` → 404 `SESSION_NOT_FOUND`。
-- **既有狀況**：`test_core_bus.py` 1 個既有 ruff F401（HEAD 已存在，非本次引入）。
+- **AC-1**：`test_round_started_*` / `test_expert_started_*` 驗證輪次＋焦點與發言中專家名稱；
+  整合 `test_watch_streams_progress_until_report_completed` 端到端見「第 1/2 輪」「甲/乙/丙」「發言中」。
+- **AC-2**：`test_round_summary_*` / `test_report_completed_*` 驗證輪次總結與「報告完成」（終態回傳 True）。
+- **AC-3**：`test_session_failed_*`（有/無部分結果）與整合 `test_watch_source_failure_*` 驗證印出失敗原因、
+  不偽裝成功（`completed=False`、輸出無「報告完成」）、以 exit 1 結束（OPS-1）。
+- **邊界**：`test_watch_unknown_session_reports_error` → 404 拒絕轉 `WatchConnectionError`、exit 1。
 
 ## 已知限制 / Tester 重點
-- API 層以 stub JobManager 隔離，未驅動真實背景任務／CLI（沿用 Story 5.2 模式）。
-- **retry 重跑的引擎續跑**：SourceInvalid（驗證前失敗、無 rounds）重跑乾淨。Failed 若已落地部分 rounds，現行引擎 `run` 從 round 1 重建會撞 `uq_round_session_round_number` 唯一約束（引擎尚未使用 `get_resume_position` 續跑）。此為引擎 resume 能力缺口（屬另一 story），非本端點 story 範圍；端點已正確重設狀態並重排。建議交付 Architect/後續 resume story 處理。
-- 多程序部署下 in-memory JobManager 取消 signal 僅及本程序；DB 落地 Cancelled 為跨程序權威記錄。
+- 整合測試以 `_GatedAdapter` + TestClient 注入驅動，未連真實遠端服務；生產 WS 路徑
+  （`websockets.sync`）以單元層 URL 推導覆蓋，未做真實網路 e2e。
+- `watch` 串流中途斷線（非終態）視為 exit 0；如需「中斷即失敗」語意需再議。
