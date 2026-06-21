@@ -186,6 +186,17 @@ class CreateSessionAccepted(_CamelModel):
     status: SessionStatus
 
 
+class SessionStatusOut(_CamelModel):
+    """單一 ``status`` 確認回應（Story 5.3 / FR-14, OPS-2）。
+
+    取消與重試端點皆回傳會話轉移後的狀態：
+    - `POST /sessions/{id}/cancel` → 200 `{status:"Cancelled"}`（AC-1）。
+    - `POST /sessions/{id}/retry` → 202 `{status:"ValidatingSource"}`（AC-2）。
+    """
+
+    status: SessionStatus
+
+
 class SourceStatusOut(_CamelModel):
     """`GET /source/status` 回應（Story 3.5 / FR-4, OPS-1）。
 
@@ -212,5 +223,6 @@ __all__ = [
     "CreateSessionRequest",
     "CreateSessionResponse",
     "CreateSessionAccepted",
+    "SessionStatusOut",
     "SourceStatusOut",
 ]

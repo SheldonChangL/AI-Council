@@ -184,13 +184,18 @@ def test_delete_missing_session_returns_404(client):
 
 
 class _StubJobManager:
-    """記錄被排程的 session_id，避免測試驅動真實背景任務／CLI。"""
+    """記錄被排程／取消的 session_id，避免測試驅動真實背景任務／CLI。"""
 
     def __init__(self) -> None:
         self.started: list[int] = []
+        self.cancelled: list[int] = []
 
     def start(self, session_id: int) -> None:
         self.started.append(session_id)
+
+    def cancel(self, session_id: int) -> bool:
+        self.cancelled.append(session_id)
+        return True
 
 
 @pytest.fixture
@@ -296,3 +301,128 @@ def test_create_session_distinct_keys_create_distinct_sessions(client, jobs_stub
 
     assert first.json()["sessionId"] != second.json()["sessionId"]
     assert len(jobs_stub.started) == 2
+
+
+# === Story 5.3 — 取消與重試端點（FR-14, OPS-2 / AC-1~AC-3）===
+
+
+def _status_of(engine, session_id: int) -> SessionStatus:
+    with DBSession(engine) as db:
+        return db.get(Session, session_id).status
+
+
+# --- AC-1：取消 Running 會話 → 200 {status:"Cancelled"} 並 signal 取消 ---
+def test_cancel_running_session_returns_200_cancelled(client, db_engine, jobs_stub):
+    session_id = _insert_session(db_engine, status=SessionStatus.Running)
+
+    resp = client.post(f"/sessions/{session_id}/cancel")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "Cancelled"}
+    # 背景任務取消旗標已 signal，且終態已權威落地。
+    assert jobs_stub.cancelled == [session_id]
+    assert _status_of(db_engine, session_id) == SessionStatus.Cancelled
+
+
+@pytest.mark.parametrize(
+    "non_terminal", [SessionStatus.Created, SessionStatus.ValidatingSource]
+)
+def test_cancel_non_terminal_states_are_cancellable(
+    client, db_engine, jobs_stub, non_terminal
+):
+    session_id = _insert_session(db_engine, status=non_terminal)
+
+    resp = client.post(f"/sessions/{session_id}/cancel")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "Cancelled"
+    assert _status_of(db_engine, session_id) == SessionStatus.Cancelled
+
+
+# --- AC-1：取消終態會話 → 409 NOT_CANCELLABLE，不 signal、狀態不變 ---
+@pytest.mark.parametrize(
+    "terminal",
+    [
+        SessionStatus.Completed,
+        SessionStatus.Failed,
+        SessionStatus.SourceInvalid,
+        SessionStatus.Cancelled,
+    ],
+)
+def test_cancel_terminal_session_returns_409(client, db_engine, jobs_stub, terminal):
+    session_id = _insert_session(db_engine, status=terminal)
+
+    resp = client.post(f"/sessions/{session_id}/cancel")
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "NOT_CANCELLABLE"
+    assert jobs_stub.cancelled == []
+    assert _status_of(db_engine, session_id) == terminal
+
+
+def test_cancel_missing_session_returns_404(client, jobs_stub):
+    resp = client.post("/sessions/9999/cancel")
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["code"] == "SESSION_NOT_FOUND"
+    assert jobs_stub.cancelled == []
+
+
+# --- AC-2：重試 SourceInvalid/Failed → 202 {status:"ValidatingSource"} 並重新排程 ---
+@pytest.mark.parametrize(
+    "retryable", [SessionStatus.SourceInvalid, SessionStatus.Failed]
+)
+def test_retry_failed_session_returns_202_validating(
+    client, db_engine, jobs_stub, retryable
+):
+    session_id = _insert_session(db_engine, status=retryable)
+
+    resp = client.post(f"/sessions/{session_id}/retry")
+
+    assert resp.status_code == 202
+    assert resp.json() == {"status": "ValidatingSource"}
+    # 已重新排程，且起點狀態已權威落地。
+    assert jobs_stub.started == [session_id]
+    assert _status_of(db_engine, session_id) == SessionStatus.ValidatingSource
+
+
+# --- AC-3：重試 Completed → 409 NOT_RETRYABLE，不重新排程、狀態不變 ---
+def test_retry_completed_session_returns_409(client, db_engine, jobs_stub):
+    session_id = _insert_session(db_engine, status=SessionStatus.Completed)
+
+    resp = client.post(f"/sessions/{session_id}/retry")
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "NOT_RETRYABLE"
+    assert jobs_stub.started == []
+    assert _status_of(db_engine, session_id) == SessionStatus.Completed
+
+
+@pytest.mark.parametrize(
+    "non_retryable",
+    [
+        SessionStatus.Created,
+        SessionStatus.ValidatingSource,
+        SessionStatus.Running,
+        SessionStatus.Cancelled,
+    ],
+)
+def test_retry_non_retryable_states_return_409(
+    client, db_engine, jobs_stub, non_retryable
+):
+    session_id = _insert_session(db_engine, status=non_retryable)
+
+    resp = client.post(f"/sessions/{session_id}/retry")
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "NOT_RETRYABLE"
+    assert jobs_stub.started == []
+    assert _status_of(db_engine, session_id) == non_retryable
+
+
+def test_retry_missing_session_returns_404(client, jobs_stub):
+    resp = client.post("/sessions/9999/retry")
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["code"] == "SESSION_NOT_FOUND"
+    assert jobs_stub.started == []

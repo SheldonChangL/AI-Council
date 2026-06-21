@@ -28,11 +28,12 @@ from eps.api.schemas import (
     CreateSessionRequest,
     PersonaOut,
     SessionDetailOut,
+    SessionStatusOut,
     SessionSummary,
     SourceStatusOut,
 )
 from eps.core.jobs import JobManager
-from eps.data.models import SessionStatus
+from eps.data.models import RETRYABLE_STATUSES, TERMINAL_STATUSES, SessionStatus
 from eps.data.repository import ExpertSpec, Repository
 
 router = APIRouter()
@@ -67,6 +68,28 @@ def _session_not_found(session_id: int) -> HTTPException:
         detail={
             "code": "SESSION_NOT_FOUND",
             "message": f"session {session_id} not found",
+        },
+    )
+
+
+def _not_cancellable(session_id: int, current: SessionStatus) -> HTTPException:
+    """終態會話不可取消（Story 5.3 / AC-1）→ 409 ``NOT_CANCELLABLE``。"""
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "NOT_CANCELLABLE",
+            "message": f"session {session_id} 狀態 {current.value} 為終態，不可取消",
+        },
+    )
+
+
+def _not_retryable(session_id: int, current: SessionStatus) -> HTTPException:
+    """非失敗終態會話不可重試（Story 5.3 / AC-3）→ 409 ``NOT_RETRYABLE``。"""
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "NOT_RETRYABLE",
+            "message": f"session {session_id} 狀態 {current.value} 不可重試",
         },
     )
 
@@ -213,6 +236,63 @@ def delete_session(
     if not repo.delete_session(session_id):
         raise _session_not_found(session_id)
     return None
+
+
+@router.post("/sessions/{session_id}/cancel", response_model=SessionStatusOut)
+async def cancel_session(
+    session_id: int,
+    repo: Repository = Depends(get_repository),
+    jobs: JobManager = Depends(get_job_manager),
+) -> SessionStatusOut:
+    """取消進行中的會話（Story 5.3 / FR-14, OPS-2 / AC-1）。
+
+    - 非終態會話（``Created`` / ``ValidatingSource`` / ``Running``）→ 200
+      ``{status:"Cancelled"}``：先 signal 背景任務取消旗標（引擎於回合／專家邊界
+      轉入 ``Cancelled`` 並保留已落地的部分結果），再就地落地 ``Cancelled`` 終態，
+      使回應與 DB 立即一致。即便背景任務把手已不在（多程序或重啟、:meth:`JobManager.cancel`
+      回 ``False``），仍以 DB 為權威記錄使用者的取消請求。
+    - 終態會話（``Completed`` / ``Failed`` / ``SourceInvalid`` / ``Cancelled``）→ 409
+      ``NOT_CANCELLABLE``。
+    - 會話不存在 → 404 ``SESSION_NOT_FOUND``。
+    """
+    session = repo.get_session(session_id)
+    if session is None:
+        raise _session_not_found(session_id)
+    if session.status in TERMINAL_STATUSES:
+        raise _not_cancellable(session_id, session.status)
+
+    jobs.cancel(session_id)  # best-effort：signal 背景引擎於邊界停止並保留部分結果。
+    repo.set_status(session_id, SessionStatus.Cancelled)  # 權威落地終態。
+    return SessionStatusOut(status=SessionStatus.Cancelled)
+
+
+@router.post(
+    "/sessions/{session_id}/retry",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=SessionStatusOut,
+)
+async def retry_session(
+    session_id: int,
+    repo: Repository = Depends(get_repository),
+    jobs: JobManager = Depends(get_job_manager),
+) -> SessionStatusOut:
+    """重試失敗的會話（Story 5.3 / FR-14, OPS-2 / AC-2, AC-3）。
+
+    - 失敗終態會話（``SourceInvalid`` / ``Failed``）→ 202 ``{status:"ValidatingSource"}``：
+      就地落地 ``ValidatingSource`` 並重新排程背景任務，使其重新進入來源驗證後續跑
+      （與 HTTP 連線解耦）。
+    - 其餘狀態（含成功終態 ``Completed``、進行中與 ``Cancelled``）→ 409 ``NOT_RETRYABLE``。
+    - 會話不存在 → 404 ``SESSION_NOT_FOUND``。
+    """
+    session = repo.get_session(session_id)
+    if session is None:
+        raise _session_not_found(session_id)
+    if session.status not in RETRYABLE_STATUSES:
+        raise _not_retryable(session_id, session.status)
+
+    repo.set_status(session_id, SessionStatus.ValidatingSource)  # 權威落地重試起點。
+    jobs.start(session_id)  # 重新排程：背景引擎重跑來源驗證後續流程。
+    return SessionStatusOut(status=SessionStatus.ValidatingSource)
 
 
 @router.get("/source/status", response_model=SourceStatusOut)
