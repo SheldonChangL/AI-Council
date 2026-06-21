@@ -119,6 +119,10 @@ class Session(SQLModel, table=True):
     source_url: Optional[str] = Field(default=None)
     # Story 2.4 / AC-2：會話完成後產出的最終綜整報告（每場會話 1:1，未完成為 None）。
     final_report: Optional[str] = Field(default=None)
+    # Story 4.6 / OPS-3：會話結束後彙總的用量統計（輪次×專家用量），以 JSON 文字
+    # 持久化（每場會話 1:1，未統計為 None）。沿用 final_report 的 nullable 欄位先例，
+    # 不新增資料表。
+    usage_stats: Optional[str] = Field(default=None)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 

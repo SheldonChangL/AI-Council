@@ -1,22 +1,23 @@
-# Story 4.5 — 取消與失敗路徑（保存部分結果）
+# Story 4.6 — 背景任務生命週期、併發 semaphore 與用量統計（FR-13 / NFR-4 / OPS-3）
 
 ## 決策
-- **不發明取消管道**：以注入式 `cancel_token: asyncio.Event` 表達取消請求，引擎在每輪起點與每位專家發言前檢查；命中即停止推進。傳輸/API 層負責 set token（與 `bus.py` / DI 去耦風格一致）。
-- **部分結果天然保留**：已落地的 `Contribution`/回合總結為 append-only（`append_contribution`），失敗路徑不刪除即保留（AC-1/2/3）。`partialAvailable` 以既有 `Repository.get_resume_position` 是否為 None 判定，不另存欄位。
-- **不臆造內容（AC-2）**：失敗路徑提前 return，絕不呼叫 `compose_final_report`，故不產生虛構報告；落地的 viewpoint 皆為 adapter 真實輸出。
-- **錯誤分類沿用 Story 3.x 契約**：`SourceError`→`SourceInvalid`、其餘 `AdapterError`（含 `RetryExhaustedError`/`AuthError`/`AdapterTimeout`）→`Failed`，與 OPS-1「終止而非 silent 續行」一致。
-- **失敗終態統一通知**：`StatusChanged(<status>)` + `SessionFailed(reason, partialAvailable)`；`SessionFailed` 新增 `partial_available` 欄位（序列化為 `partialAvailable`）。
+- **JobManager 自包含**：注入 `engine` / `repo` / `bus`，持有全域 `asyncio.Semaphore(max_concurrency)`。`start(session_id)` 以 `asyncio.create_task` 建背景任務並**立即回傳** `JobHandle`，與 HTTP 連線解耦（AC-1）。HTTP/transport 層的接線留待後續 story（本 story 為 prereq，僅建機制）。
+- **併發閘門**：semaphore 在背景任務內、`engine.run()` **外圈** acquire，故等待名額時 in-flight 引擎（→CLI 子行程）數不超過上限，超出者排隊（AC-2）。每個 job 各自 `JobHandle` + `cancel_token`，狀態互不污染。
+- **用量持久化沿用 Story 2.4 先例**：在 `session` 新增 nullable `usage_stats`（JSON 文字）欄位，**不新增資料表**。用量由會話結束後的 `get_session_detail` 彙總（rounds / experts / contributions ＋每位專家發言數）。
+- **僅監測不中止（OPS-3）**：用量統計在 `_run_job` 的 `finally` 區塊執行，成功/失敗/取消路徑皆發佈 `UsageStats` 事件並持久化；統計自身失敗只 log、絕不影響會話結果。
 
 ## 計畫
-- [x] `eps/core/events.py`：`SessionFailed` 新增 `partial_available: bool = False`。
-- [x] `eps/core/engine.py`：`run(..., cancel_token=None)`；Running 階段 try/except 攔截 `_Cancelled`/`SourceError`/`AdapterError`，分別轉 `Cancelled`/`SourceInvalid`/`Failed`；新增 `_raise_if_cancelled` 與 `_fail`（轉態 + 發 `SessionFailed`，含 partialAvailable）；`_run_round` 每位專家前檢查取消。
-- [x] `eps/adapters/fake.py`：新增 `error_after`（方法名→允許成功次數）以模擬「跑出部分結果後才失敗」，向後相容（預設立即拋）。
-- [x] `tests/test_core_engine.py`：AC-1 取消（含部分結果保留 + 事件）/ AC-2 執行中 SourceError / AC-3 RetryExhausted。
-- [x] 驗證：`uv run pytest` 全綠（197 passed）；`ruff check` 全綠；CI 僅 gate pytest。
+- [x] `eps/data/models.py`：`Session` 新增 `usage_stats: Optional[str] = None`（nullable JSON 文字）。
+- [x] `migrations/versions/0003_usage_stats.py`：`session` 新增 `usage_stats` 欄位（nullable）。
+- [x] `eps/data/repository.py`：新增 `save_usage_stats(session_id, usage_stats_json)`（單 transaction 落地）。
+- [x] `eps/core/jobs.py`：`JobState` / `JobHandle` / `compute_usage` / `JobManager`（start / status / cancel / 背景任務 + semaphore + 用量發佈）。
+- [x] `tests/test_core_jobs.py`：AC-1 立即回傳與狀態查詢 / AC-2 semaphore 上限＋會話隔離 / AC-3 用量發佈＋持久化（含失敗路徑僅監測不中止）。
+- [x] `tests/test_migrations.py`：head 更新為 `0003_usage_stats`，新增 `session.usage_stats` 欄位測試。
+- [x] 驗證：`uv run pytest` 全綠（206 passed）；CI 僅 gate pytest。
 
 ## Review
-- **AC-1**：`test_cancel_preserves_partial_and_emits_events`——進行中取消轉 `Cancelled`，首位專家已落地發言（`vA`）保留、第二位未發言，發出 `StatusChanged(Cancelled)` + `SessionFailed(partialAvailable=True)`，且未呼叫 `compose_final_report`（`final_report` 為 None，不臆造）。`test_cancel_before_any_round_has_no_partial`——開跑前取消則無部分結果、`partialAvailable=False`。
-- **AC-2**：`test_running_source_error_marks_source_invalid_and_keeps_partial`——執行中 `invoke` 拋 `SourceError` → `SourceInvalid`、保留 `vA`、`SessionFailed.reason` 含「重新登入後重試」且 `partialAvailable=True`、未產生報告。
-- **AC-3**：`test_retry_exhausted_marks_failed_and_keeps_partial`——`RetryExhaustedError` → `Failed`、保留部分結果、`partialAvailable=True`、reason 透傳底層訊息。
-- **不破壞既有**：來源「初次驗證」失敗路徑（`test_source_invalid_short_circuits`）維持原行為；`run`/`_run_round` 新增參數皆為 keyword 預設值，向後相容；`FakeAdapter.error_after` 預設空映射＝既有立即拋行為。全套件 197 passed。
-- **設計備註**：取消管道採注入式 `asyncio.Event`，引擎於回合／專家邊界檢查；部分結果保留依賴既有 append-only 落地（不刪除即保留），`partialAvailable` 由 `get_resume_position` 判定，無新增 schema/migration。
+- **AC-1**：`test_start_returns_immediately_and_is_queryable`——`start()` 回傳把手時背景任務尚未完成（`task.done()` 為 False，與呼叫端解耦），`status()` 立即可查；放行後 `Finished` 並反映會話終態。`test_status_none_for_unknown_session` 未啟動回 None；`test_start_is_idempotent_while_in_flight` 進行中重複 start 回同一把手、不重複啟動。
+- **AC-2**：`test_semaphore_caps_in_flight_and_queues_excess`——上限 2、啟動 5 個，in-flight 引擎數恆為 2、超出者 `Pending` 排隊；放行後全程峰值不超過上限且 5 個全部完成。`test_cancel_one_session_does_not_pollute_others`——僅取消 s1，s2 取消旗標未被 set，終態 s1=Cancelled、s2=Completed（狀態互不污染）。
+- **AC-3**：`test_usage_published_and_persisted_on_completion`——2 輪×2 專家發佈 `UsageStats`（rounds=2/experts=2/contributions=4 ＋每位專家 2 次），`session.usage_stats` 持久化且與事件一致，終態仍為 Completed。`test_usage_published_on_failure_without_aborting`——失敗路徑仍發佈/持久化部分用量（contributions=1），會話維持 Failed、不臆造報告（僅監測不中止）。`test_compute_usage_counts_per_expert` 直接驗證純函式彙總。
+- **設計備註 / 範圍**：JobManager 為自包含單元（注入 engine/repo/bus），未接線 FastAPI——HTTP/transport 啟動端點與 app 層 EventBus 屬後續 story（本 story 為 prereq，僅建機制）。用量持久化沿用 Story 2.4 `final_report` 的 nullable 欄位先例，維持五張表、不新增資料表。
+- **既有狀況**：`test_core_bus.py` / 另一測試檔有 2 個既有 ruff F401（在 HEAD 已存在，非本次引入）；CI 僅 gate `uv run pytest`，不受影響。依最小變更原則未一併修改。
