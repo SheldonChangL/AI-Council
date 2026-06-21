@@ -167,6 +167,19 @@ class Repository:
             )
             return list(db.exec(stmt).all())
 
+    def list_personas(self, builtin_only: bool = True) -> List[PersonaTemplate]:
+        """列出 Persona 模板，預設僅回傳系統內建模板（Story 2.6 / AC-2）。
+
+        依 ``id`` 遞增排序（即內建 seed 的寫入順序）。``builtin_only`` 為 ``True``
+        時僅回傳 ``builtin=True`` 的模板。
+        """
+        with DBSession(self._engine) as db:
+            stmt = select(PersonaTemplate)
+            if builtin_only:
+                stmt = stmt.where(PersonaTemplate.builtin == True)  # noqa: E712
+            stmt = stmt.order_by(PersonaTemplate.id)
+            return list(db.exec(stmt).all())
+
     def get_session_detail(self, session_id: int) -> Optional[SessionDetail]:
         """回傳含 rounds/contributions/final_report 的完整會話聚合（AC-2）。
 
