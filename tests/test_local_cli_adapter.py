@@ -15,23 +15,63 @@ import pytest
 from eps.adapters import (
     AuthError,
     LocalCliAdapter,
+    RetryExhaustedError,
     TransientError,
 )
 from eps.config import Settings
 
 
+class _FakeStdin:
+    """模擬 ``StreamWriter``：累積 invoke 串流路徑餵入的 prompt bytes。"""
+
+    def __init__(self) -> None:
+        self.buffer = b""
+
+    def write(self, data: bytes) -> None:
+        self.buffer += data
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+class _FakeStream:
+    """模擬 ``StreamReader``：以腳本化 bytes 提供 readline / read。"""
+
+    def __init__(self, data: bytes) -> None:
+        self._lines = data.splitlines(keepends=True)
+        self._idx = 0
+
+    async def readline(self) -> bytes:
+        if self._idx >= len(self._lines):
+            return b""  # EOF
+        line = self._lines[self._idx]
+        self._idx += 1
+        return line
+
+    async def read(self) -> bytes:
+        rest = b"".join(self._lines[self._idx :])
+        self._idx = len(self._lines)
+        return rest
+
+
 class _FakeProcess:
-    """模擬 ``asyncio.subprocess.Process``：communicate 回傳腳本化輸出。"""
+    """模擬 ``asyncio.subprocess.Process``：以串流 stdout/stderr 腳本化輸出。"""
 
     def __init__(self, *, stdout: bytes, stderr: bytes, returncode: int) -> None:
-        self._stdout = stdout
-        self._stderr = stderr
+        self.stdout = _FakeStream(stdout)
+        self.stderr = _FakeStream(stderr)
+        self.stdin = _FakeStdin()
         self.returncode = returncode
-        self.stdin_received: bytes | None = None
+        self.killed = False
 
-    async def communicate(self, input: bytes | None = None):  # noqa: A002
-        self.stdin_received = input
-        return self._stdout, self._stderr
+    async def wait(self) -> int:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
 
 
 def _install_fake_exec(monkeypatch, proc: _FakeProcess) -> dict:
@@ -109,8 +149,7 @@ async def test_command_args_and_stdin(monkeypatch):
     assert "--verbose" in args
     # stdin 以 PIPE 開啟，且 prompt 內含 persona 與 focus。
     assert captured["kwargs"]["stdin"] is asyncio.subprocess.PIPE
-    assert proc.stdin_received is not None
-    fed = proc.stdin_received.decode("utf-8")
+    fed = proc.stdin.buffer.decode("utf-8")
     assert "某 focus" in fed
     assert "某 persona" in fed
 
@@ -128,16 +167,19 @@ async def test_cli_path_defaults_to_settings(monkeypatch):
     assert captured["args"][0] == "codex-from-settings"
 
 
-# AC-3：非零退出且非 auth 類 → 可重試的 TransientError。
-async def test_nonzero_exit_raises_transient(monkeypatch):
+# AC-3：非零退出且非 auth 類 → 內部分類為可重試的 TransientError。
+# Story 3.4 起 invoke 在重試耗盡後改拋 RetryExhaustedError，底層分類保留於 __cause__。
+# 此處以 max_retries=0 隔離單次嘗試，專注驗證「非 auth 非零 → TransientError」分類。
+async def test_nonzero_exit_classified_transient(monkeypatch):
     proc = _FakeProcess(
         stdout=b"", stderr=b"network unreachable, try again", returncode=1
     )
     _install_fake_exec(monkeypatch, proc)
 
-    adapter = LocalCliAdapter(cli_path="codex")
-    with pytest.raises(TransientError):
+    adapter = LocalCliAdapter(cli_path="codex", max_retries=0)
+    with pytest.raises(RetryExhaustedError) as excinfo:
         await adapter.invoke("p", "f")
+    assert isinstance(excinfo.value.__cause__, TransientError)
 
 
 # AC-3：auth 類失敗 → 不可重試的 AuthError（非 TransientError）。
