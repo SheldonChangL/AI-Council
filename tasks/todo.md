@@ -1,21 +1,23 @@
-# Story 3.2 — LocalCliAdapter 子行程 spawn 與 stream-json 全輪次串接
+# Story 3.3 — LocalCliAdapter 來源驗證與 auth 偵測（validate_source）
 
 ## 決策
-- CLI 契約沿用既有來源：`config.py` 的 `DEFAULT_CLI_PATH="codex"` / `EPS_CLI_PATH`，不發明執行檔名。
-- AC-3 需區分「非 auth 類非零退出（可重試）」與「auth 類（不可重試）」，故在 `base.py` 新增 `TransientError` 與 `AuthError`（皆 `AdapterError` 子類）。
-- OPS-4 核心：逐行解析 stream-json，串接「全部」`assistant.message.content[].text`，不可只取最後一筆 / `result`。
-- 容錯：跳過空白行與無法解析的雜訊行，不因單行中斷整體解析。
-- [prereq] 範圍：僅實作 `invoke()` 所需的 spawn + 解析；其餘 Protocol 方法留待後續 story（避免發明 prompt 契約）。
+- `validate_source()` 既有契約來自 `base.py` Protocol：無效拋 `SourceError`，有效回傳 `None`。沿用，不發明。
+- AC-1（CLI 未安裝）：以 `shutil.which(cli_path)` 偵測執行檔；找不到 → `SourceError`，訊息指示「修復環境／安裝 CLI」。並對 spawn 時的 `FileNotFoundError` 做相同保底。
+- auth 偵測**不發明新 flag/subcommand**：沿用與 `invoke` 完全相同的 `STREAM_JSON_ARGS`，僅以最小 probe prompt 驅動，再依退出碼＋輸出分類。
+- AC-2（非零退出且輸出含 auth/login 關鍵字）：判為 `SourceError`（來源類），**不視為 transient**。重用既有 `_AUTH_MARKERS`，比對 stdout+stderr（AC 措辭為「輸出」）。
+- 非 auth 類非零退出：維持 `TransientError`（與 Story 3.2 一致，可重試），與來源類明確區隔。
+- AC-3（CLI 已安裝且 OAuth 有效）：退出碼 0 → 回傳 `None`（valid）。
+- 重點區分：`validate_source` 的 auth 失敗映射為 `SourceError`（pre-flight 來源類，擋啟動）；`invoke` 的 auth 失敗仍為 `AuthError`（runtime，Story 3.2）。
+- 重構：抽出 `_spawn(prompt)` 共用 spawn+communicate+decode，`_run` 與 `validate_source` 共用，降低重複且不改既有行為。
 
 ## 計畫
-- [x] `eps/adapters/base.py`：新增 `TransientError`（可重試）、`AuthError`（不可重試），更新 `__all__`
-- [x] `eps/adapters/local_cli.py`：`LocalCliAdapter`（`create_subprocess_exec` + stdin prompt + stream-json 解析 + 退出碼分類）
-- [x] `eps/adapters/__init__.py`：匯出 `LocalCliAdapter` / `TransientError` / `AuthError`
-- [x] `tests/test_local_cli_adapter.py`：AC-1（多輪串接、容錯）、AC-2（命令旗標 / stdin / 設定預設）、AC-3（Transient / Auth 分類）
-- [x] 驗證：完整 pytest 全綠（130 passed）
+- [x] `eps/adapters/local_cli.py`：`import shutil`；新增 `_VALIDATION_PROBE`；抽出 `_spawn()`；`_run()` 改用 `_spawn()`；新增 `validate_source()`
+- [x] `tests/test_local_cli_validate_source.py`：AC-1 / AC-2 / AC-3 + 非 auth 非零 → Transient 的區隔
+- [x] 驗證：完整 pytest 全綠（136 passed）
 
 ## Review
-- AC-1：`test_concatenates_all_assistant_turns` 驗證多個 assistant 訊息 + 多 content block 全部串接、前段不遺漏；`test_tolerates_blank_and_malformed_lines` 驗證容錯。
-- AC-2：`test_command_args_and_stdin` 驗證 `--output-format stream-json --verbose` 與 stdin（含 persona/focus）；`test_cli_path_defaults_to_settings` 驗證設定來源。
-- AC-3：`test_nonzero_exit_raises_transient` / `test_auth_failure_raises_auth_error` 驗證可重試 vs 不可重試分類。
-- 未改動既有 `LLMAdapter` Protocol 與 `FakeAdapter`；既有測試全數維持通過。
+- AC-1：`test_missing_cli_raises_source_error`（which→None）驗證 `SourceError` 且訊息含執行檔名與安裝/環境指示；`test_spawn_filenotfound_maps_to_source_error` 驗證 spawn 競態保底。
+- AC-2：`test_auth_failure_raises_source_error_not_transient`（stderr auth）、`test_auth_marker_in_stdout_raises_source_error`（stdout auth）驗證來源類；`test_nonauth_nonzero_raises_transient` 驗證非 auth 非零仍為 `TransientError`，確立來源類 vs transient 的區隔。
+- AC-3：`test_valid_source_returns_none`（退出碼 0）驗證回傳 `None`。
+- 重構 `_spawn()` 抽取後，既有 Story 3.2 測試（invoke 多輪串接 / 旗標 / Transient / Auth）全數維持通過；`LLMAdapter` Protocol 與 `FakeAdapter` 未動。
+- 設計區分：`validate_source` 的 auth 失敗 → `SourceError`（pre-flight 來源類）；`invoke` 的 auth 失敗 → `AuthError`（runtime），兩者不混用。
