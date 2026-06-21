@@ -24,6 +24,7 @@ from enum import Enum
 from typing import Any, Optional
 
 from pydantic import ConfigDict, field_validator
+from sqlalchemy import Index, UniqueConstraint, text
 from sqlmodel import Field, SQLModel
 
 # 藍圖 §3.2：Session.topic 長度上限與 max_rounds 合法範圍。
@@ -99,6 +100,11 @@ class Session(SQLModel, table=True):
     model_config = ConfigDict(validate_assignment=True)  # type: ignore[assignment]
 
     __tablename__ = "session"
+    # AC-2：列表查詢用索引（最近建立優先）與狀態篩選索引。
+    __table_args__ = (
+        Index("ix_session_created_at", text("created_at DESC")),
+        Index("ix_session_status", "status"),
+    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     topic: str = Field(max_length=TOPIC_MAX_LENGTH)
@@ -139,10 +145,16 @@ class Round(SQLModel, table=True):
     """會話中的一個回合。"""
 
     __tablename__ = "round"
+    # AC-2/AC-3：同一會話的回合序號唯一。
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id", "round_number", name="uq_round_session_round_number"
+        ),
+    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     session_id: int = Field(foreign_key="session.id", index=True)
-    index: int = Field(default=0)
+    round_number: int = Field(default=0)
     created_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -150,10 +162,16 @@ class Contribution(SQLModel, table=True):
     """某位專家在某回合的單次發言。"""
 
     __tablename__ = "contribution"
+    # AC-2：同一回合內發言序號唯一，並以 (round_id, seq) 索引支撐有序讀取。
+    __table_args__ = (
+        UniqueConstraint("round_id", "seq", name="uq_contribution_round_seq"),
+        Index("ix_contribution_round_seq", "round_id", "seq"),
+    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     round_id: int = Field(foreign_key="round.id", index=True)
     session_expert_id: int = Field(foreign_key="session_expert.id", index=True)
+    seq: int = Field(default=0)
     content: str = ""
     created_at: datetime = Field(default_factory=_utcnow)
 

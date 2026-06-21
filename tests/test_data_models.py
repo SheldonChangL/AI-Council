@@ -138,7 +138,7 @@ def test_full_session_graph_persists():
         session.commit()
         session.refresh(expert)
 
-        rnd = Round(session_id=sess.id, index=1)
+        rnd = Round(session_id=sess.id, round_number=1)
         session.add(rnd)
         session.commit()
         session.refresh(rnd)
