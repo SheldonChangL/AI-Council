@@ -14,6 +14,7 @@ from eps.config import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
     DEFAULT_STALL_TIMEOUT_SECONDS,
+    DEFAULT_WS_HEARTBEAT_SECONDS,
     Settings,
 )
 
@@ -41,6 +42,8 @@ def test_settings_defaults():
     assert settings.stall_timeout_seconds == DEFAULT_STALL_TIMEOUT_SECONDS
     assert settings.max_retries == DEFAULT_MAX_RETRIES
     assert settings.retry_backoff_base_seconds == DEFAULT_RETRY_BACKOFF_BASE_SECONDS
+    # Story 5.5：WS 閒置心跳間隔預設值。
+    assert settings.ws_heartbeat_seconds == DEFAULT_WS_HEARTBEAT_SECONDS
 
 
 # AC-2: 環境變數覆寫。
@@ -52,6 +55,7 @@ def test_settings_reads_env_overrides():
         "EPS_STALL_TIMEOUT_SECONDS": "120",
         "EPS_MAX_RETRIES": "3",
         "EPS_RETRY_BACKOFF_BASE_SECONDS": "0.5",
+        "EPS_WS_HEARTBEAT_SECONDS": "15",
     }
     settings = Settings.from_env(environ=env)
     assert settings.db_url == "sqlite:////tmp/custom.db"
@@ -60,6 +64,7 @@ def test_settings_reads_env_overrides():
     assert settings.stall_timeout_seconds == 120.0
     assert settings.max_retries == 3
     assert settings.retry_backoff_base_seconds == 0.5
+    assert settings.ws_heartbeat_seconds == 15.0
 
 
 def test_settings_rejects_concurrency_over_limit():
@@ -86,6 +91,12 @@ def test_settings_rejects_negative_max_retries():
 def test_settings_rejects_non_numeric_backoff():
     with pytest.raises(ValueError):
         Settings.from_env(environ={"EPS_RETRY_BACKOFF_BASE_SECONDS": "abc"})
+
+
+# Story 5.5：WS 心跳間隔須 > 0。
+def test_settings_rejects_non_positive_ws_heartbeat():
+    with pytest.raises(ValueError):
+        Settings.from_env(environ={"EPS_WS_HEARTBEAT_SECONDS": "0"})
 
 
 # AC-3: eps 套件內不得使用相對 import。

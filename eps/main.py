@@ -72,6 +72,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.job_manager = JobManager(
         job_engine, repo, bus, max_concurrency=settings.max_concurrency
     )
+    # Story 5.5 / AC-3：WS 事件流閒置心跳間隔，供 `/sessions/{id}/events` 讀取。
+    app.state.ws_heartbeat_seconds = settings.ws_heartbeat_seconds
     try:
         yield
     finally:
