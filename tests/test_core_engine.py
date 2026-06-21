@@ -11,9 +11,13 @@ import pytest
 from sqlmodel import SQLModel, create_engine
 
 from eps.adapters import FakeAdapter
-from eps.adapters.base import SourceError
+from eps.adapters.base import RetryExhaustedError, SourceError
 from eps.core.bus import EventBus
-from eps.core.engine import OrchestrationEngine
+from eps.core.engine import (
+    CANCELLED_REASON,
+    SOURCE_INVALID_REASON,
+    OrchestrationEngine,
+)
 from eps.data.models import SessionStatus
 from eps.data.repository import Repository
 
@@ -49,13 +53,15 @@ async def _collect(sub, stop_token="ReportCompleted"):
     return out
 
 
-async def _run_and_collect(repo, adapter, session_id, *, stop_token="ReportCompleted"):
+async def _run_and_collect(
+    repo, adapter, session_id, *, stop_token="ReportCompleted", cancel_token=None
+):
     """訂閱、併發收集事件並執行引擎，回傳 (events, runtime)。"""
     bus = EventBus()
     sub = bus.subscribe(session_id)
     engine = OrchestrationEngine(repo, adapter, bus)
     task = asyncio.create_task(_collect(sub, stop_token))
-    runtime = await engine.run(session_id)
+    runtime = await engine.run(session_id, cancel_token=cancel_token)
     events = await asyncio.wait_for(task, timeout=2)
     return events, runtime
 
@@ -175,3 +181,147 @@ async def test_source_invalid_short_circuits(repo):
     assert detail.rounds == []
     # 來源失敗不應呼叫任何 LLM 推進方法。
     assert [name for name, _ in adapter.calls] == ["validate_source"]
+
+
+# ===========================================================================
+# Story 4.5 — 取消與失敗路徑（保存部分結果，FR-14 / OPS-1 / OPS-2 / NFR-5）。
+# ===========================================================================
+
+
+class _CancelOnFirstRefine(FakeAdapter):
+    """第一位專家焦點收斂後設定取消旗標（驗證部分結果保留與取消轉態）。
+
+    引擎在 ``refine_focus`` 後才 ``append_contribution``，故首位專家的發言仍會落地；
+    下一位專家發言前的取消檢查命中，據以驗證「已完成部分保留」（AC-1）。
+    """
+
+    def __init__(self, token: asyncio.Event, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._token = token
+
+    async def refine_focus(self, focus: str, viewpoint: str) -> str:
+        result = await super().refine_focus(focus, viewpoint)
+        self._token.set()
+        return result
+
+
+# ---------------------------------------------------------------------------
+# AC-1：進行中觸發取消 → Cancelled，已完成 Contribution 保留，發 SessionFailed/StatusChanged。
+# ---------------------------------------------------------------------------
+async def test_cancel_preserves_partial_and_emits_events(repo):
+    session = repo.create_session(topic="議題", max_rounds=1, experts=["A", "B"])
+    token = asyncio.Event()
+    adapter = _CancelOnFirstRefine(token, viewpoints=["vA", "vB"], focuses=["fA", "fB"])
+
+    events, runtime = await _run_and_collect(
+        repo, adapter, session.id, stop_token="SessionFailed", cancel_token=token
+    )
+
+    # 狀態轉為 Cancelled（執行期與落地一致）。
+    assert runtime.status == SessionStatus.Cancelled
+    detail = repo.get_session_detail(session.id)
+    assert detail.session.status == SessionStatus.Cancelled
+
+    # 已完成的第一位專家發言保留（append-only，不因取消而消失）。
+    assert [c.viewpoint for c in detail.contributions] == ["vA"]
+    assert detail.session.final_report is None  # 不臆造最終報告。
+    assert "compose_final_report" not in [name for name, _ in adapter.calls]
+    # 第二位專家未發言（取消於其發言前命中）。
+    assert sum(1 for n, _ in adapter.calls if n == "invoke") == 1
+
+    # 對外發出 StatusChanged(Cancelled) 與 SessionFailed（含 partialAvailable=True）。
+    assert _token(events[-2]) == "Cancelled"
+    failed = events[-1]
+    assert failed.type == "SessionFailed"
+    assert failed.partial_available is True
+    assert failed.reason == CANCELLED_REASON
+    assert failed.to_dict()["data"]["partialAvailable"] is True
+
+
+# AC-1：開跑前即取消 → Cancelled 且無任何部分結果（partialAvailable=False）。
+async def test_cancel_before_any_round_has_no_partial(repo):
+    session = repo.create_session(topic="議題", max_rounds=2, experts=["A"])
+    token = asyncio.Event()
+    token.set()  # 開跑前即請求取消。
+    adapter = FakeAdapter()
+
+    events, runtime = await _run_and_collect(
+        repo, adapter, session.id, stop_token="SessionFailed", cancel_token=token
+    )
+
+    assert runtime.status == SessionStatus.Cancelled
+    detail = repo.get_session_detail(session.id)
+    assert detail.contributions == []
+    assert detail.rounds == []
+    # 驗證來源後即於第一輪邊界取消，未呼叫任何專家推進方法。
+    assert [name for name, _ in adapter.calls] == ["validate_source"]
+    failed = events[-1]
+    assert failed.type == "SessionFailed"
+    assert failed.partial_available is False
+
+
+# ---------------------------------------------------------------------------
+# AC-2：執行中 adapter 回 SourceError → SourceInvalid、保存部分結果、
+#       SessionFailed(partialAvailable=True) 含「重新登入後重試」提示，不臆造內容。
+# ---------------------------------------------------------------------------
+async def test_running_source_error_marks_source_invalid_and_keeps_partial(repo):
+    session = repo.create_session(topic="議題", max_rounds=1, experts=["A", "B"])
+    adapter = FakeAdapter(
+        viewpoints=["vA"],
+        focuses=["fA"],
+        errors={"invoke": SourceError("OAuth session 失效")},
+        error_after={"invoke": 1},  # 第一位成功落地，第二位 invoke 時來源失效。
+    )
+
+    events, runtime = await _run_and_collect(
+        repo, adapter, session.id, stop_token="SessionFailed"
+    )
+
+    assert runtime.status == SessionStatus.SourceInvalid
+    detail = repo.get_session_detail(session.id)
+    assert detail.session.status == SessionStatus.SourceInvalid
+
+    # 保存部分結果：第一位專家發言保留；不臆造最終報告。
+    assert [c.viewpoint for c in detail.contributions] == ["vA"]
+    assert detail.session.final_report is None
+    assert "compose_final_report" not in [name for name, _ in adapter.calls]
+
+    # SessionFailed：partialAvailable=True 且含「重新登入後重試」提示。
+    failed = events[-1]
+    assert failed.type == "SessionFailed"
+    assert failed.partial_available is True
+    assert failed.reason == SOURCE_INVALID_REASON
+    assert "重新登入後重試" in failed.reason
+    assert _token(events[-2]) == "SourceInvalid"
+
+
+# ---------------------------------------------------------------------------
+# AC-3：非來源類 transient 錯誤重試耗盡（RetryExhaustedError）→ Failed、保存部分結果。
+# ---------------------------------------------------------------------------
+async def test_retry_exhausted_marks_failed_and_keeps_partial(repo):
+    session = repo.create_session(topic="議題", max_rounds=1, experts=["A", "B"])
+    adapter = FakeAdapter(
+        viewpoints=["vA"],
+        focuses=["fA"],
+        errors={"invoke": RetryExhaustedError("重試耗盡（最多 2 次）後仍失敗")},
+        error_after={"invoke": 1},
+    )
+
+    events, runtime = await _run_and_collect(
+        repo, adapter, session.id, stop_token="SessionFailed"
+    )
+
+    assert runtime.status == SessionStatus.Failed
+    detail = repo.get_session_detail(session.id)
+    assert detail.session.status == SessionStatus.Failed
+
+    # 保存部分結果；不臆造最終報告。
+    assert [c.viewpoint for c in detail.contributions] == ["vA"]
+    assert detail.session.final_report is None
+    assert "compose_final_report" not in [name for name, _ in adapter.calls]
+
+    failed = events[-1]
+    assert failed.type == "SessionFailed"
+    assert failed.partial_available is True
+    assert failed.reason == "重試耗盡（最多 2 次）後仍失敗"
+    assert _token(events[-2]) == "Failed"

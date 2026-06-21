@@ -160,11 +160,17 @@ class ReportCompleted(Event):
 
 @dataclass(kw_only=True)
 class SessionFailed(Event):
-    """會話失敗終態（對應 ``SessionStatus.Failed``，藍圖 §4）。"""
+    """會話失敗終態（取消／來源失效／重試耗盡，Story 4.5 / 藍圖 §4）。
+
+    ``reason`` 為對外的失敗原因（來源失效時含「重新登入後重試」提示，AC-2）；
+    ``partial_available`` 標示是否已保存可重試的部分結果（已落地的 Contribution／
+    回合總結），序列化為 ``partialAvailable``。
+    """
 
     type: ClassVar[str] = "SessionFailed"
 
     reason: str
+    partial_available: bool = False
 
 
 @dataclass(kw_only=True)

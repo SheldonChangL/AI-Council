@@ -9,6 +9,9 @@
 - **焦點**：``focuses`` 序列，由 ``refine_focus`` 依序消耗。
 - **回合摘要 / 最終報告**：``round_summaries`` 序列與 ``final_report``。
 - **錯誤**：``errors`` 為「方法名 → 例外」對映；該方法被呼叫時固定拋出。
+  ``error_after`` 為「方法名 → 允許成功次數」對映：該方法前 N 次正常返回、第 N+1
+  次起才拋 ``errors[method]``，用以模擬「跑出部分結果後才失敗」（Story 4.5）。
+  未指定時預設 0（即首次呼叫就拋，沿用既有行為）。
 - **逾時**：``timeouts`` 為方法名集合；該方法被呼叫時拋出
   :class:`~eps.adapters.base.AdapterTimeout`。
 - **SourceError**：``source_error`` 設定時，``validate_source`` 拋出之
@@ -38,6 +41,7 @@ class FakeAdapter:
         final_report: str = "FINAL_REPORT",
         source_error: Optional[BaseException] = None,
         errors: Optional[Mapping[str, BaseException]] = None,
+        error_after: Optional[Mapping[str, int]] = None,
         timeouts: Iterable[str] = (),
     ) -> None:
         self._viewpoints: Deque[str] = deque(viewpoints)
@@ -46,6 +50,7 @@ class FakeAdapter:
         self._final_report = final_report
         self._source_error = source_error
         self._errors: dict[str, BaseException] = dict(errors or {})
+        self._error_after: dict[str, int] = dict(error_after or {})
         self._timeouts = set(timeouts)
         # 記錄每次呼叫 (method, args)，供測試斷言呼叫次序與引數。
         self.calls: List[Tuple[str, tuple]] = []
@@ -56,7 +61,10 @@ class FakeAdapter:
         if method in self._timeouts:
             raise AdapterTimeout(f"FakeAdapter 腳本化逾時：{method}")
         if method in self._errors:
-            raise self._errors[method]
+            # error_after：前 N 次成功，第 N+1 次起才拋（含本次的呼叫計數）。
+            calls_so_far = sum(1 for m, _ in self.calls if m == method)
+            if calls_so_far > self._error_after.get(method, 0):
+                raise self._errors[method]
 
     async def validate_source(self, source_url: str) -> None:
         self._guard("validate_source", source_url)
