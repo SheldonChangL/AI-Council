@@ -11,8 +11,10 @@
 
 from __future__ import annotations
 
+import json
 import os
-from typing import Any, Dict, List, Optional
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional
 
 import httpx
 
@@ -23,11 +25,33 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 
 
+class WatchConnectionError(RuntimeError):
+    """WS 事件流連線失敗（如不存在的會話被 upgrade 前以 404 拒絕）。
+
+    封裝兩種傳輸路徑（注入的 ASGI TestClient／生產 websockets）的拒絕情形為單一
+    對外型別，使 CLI 命令層無需感知底層傳輸細節。``status_code`` 於可得時帶上。
+    """
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def resolve_base_url(explicit: Optional[str] = None) -> str:
     """決定 API base URL：``--base-url`` > ``EPS_API_BASE_URL`` > 預設。"""
     if explicit:
         return explicit
     return os.environ.get("EPS_API_BASE_URL", DEFAULT_BASE_URL)
+
+
+def _ws_url(base_url: str, path: str) -> str:
+    """將 HTTP base URL 轉為 WS URL（http→ws、https→wss）並接上 path。"""
+    base = str(base_url).rstrip("/")
+    if base.startswith("https://"):
+        base = "wss://" + base[len("https://"):]
+    elif base.startswith("http://"):
+        base = "ws://" + base[len("http://"):]
+    return base + path
 
 
 class EpsClient:
@@ -88,10 +112,88 @@ class EpsClient:
         resp.raise_for_status()
         return resp.json()
 
+    @contextmanager
+    def stream_events(self, session_id: int) -> Iterator[Iterator[Dict[str, Any]]]:
+        """訂閱 ``/sessions/{id}/events`` WS 事件流（Story 6.2 / FR-11）。
+
+        以 context manager 產出一個逐筆解析後的事件 dict 迭代器；離開 context 即關閉
+        連線（觀看端收到終態後即可 break 退出）。支援兩種傳輸：
+
+        - 注入路徑：底層 client 具 ``websocket_connect``（Starlette ``TestClient``）→
+          直接共用同一 ASGI app 的事件流（測試）。
+        - 生產路徑：以 ``websockets`` 同步 client 連向自 ``base_url`` 推導的 WS URL。
+
+        連線於 upgrade 前被拒（不存在的會話 → 404）時，統一拋
+        :class:`WatchConnectionError`。
+        """
+        path = f"/sessions/{session_id}/events"
+        ws_connect = getattr(self._http, "websocket_connect", None)
+        if ws_connect is not None:
+            yield from self._stream_via_testclient(ws_connect, path)
+        else:
+            yield from self._stream_via_websockets(path)
+
+    def _stream_via_testclient(
+        self, ws_connect: Any, path: str
+    ) -> Iterator[Iterator[Dict[str, Any]]]:
+        """注入路徑：經 Starlette ``TestClient.websocket_connect`` 取得事件流。"""
+        # 延遲匯入，避免 CLI 在無測試框架的生產環境硬相依 starlette。
+        from starlette.testclient import WebSocketDenialResponse
+        from starlette.websockets import WebSocketDisconnect
+
+        # 不存在的會話於 upgrade 前被拒，denial 於建立連線（或進入 context）時拋出。
+        try:
+            connection = ws_connect(path)
+            ws = connection.__enter__()
+        except WebSocketDenialResponse as denial:
+            raise WatchConnectionError(
+                f"事件流連線被拒（HTTP {denial.status_code}）",
+                status_code=denial.status_code,
+            ) from denial
+
+        def _messages() -> Iterator[Dict[str, Any]]:
+            try:
+                while True:
+                    yield ws.receive_json()
+            except WebSocketDisconnect:
+                return
+
+        try:
+            yield _messages()
+        finally:
+            connection.__exit__(None, None, None)
+
+    def _stream_via_websockets(
+        self, path: str
+    ) -> Iterator[Iterator[Dict[str, Any]]]:
+        """生產路徑：以 ``websockets`` 同步 client 連線並逐筆解析訊息。"""
+        from websockets.exceptions import ConnectionClosed, InvalidStatus
+        from websockets.sync.client import connect as ws_connect
+
+        url = _ws_url(str(self._http.base_url), path)
+        try:
+            connection = ws_connect(url)
+        except InvalidStatus as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            raise WatchConnectionError(
+                f"事件流連線被拒（HTTP {status}）", status_code=status
+            ) from exc
+
+        def _messages(ws: Any) -> Iterator[Dict[str, Any]]:
+            try:
+                for raw in ws:
+                    yield json.loads(raw)
+            except ConnectionClosed:
+                return
+
+        with connection as ws:
+            yield _messages(ws)
+
 
 __all__ = [
     "DEFAULT_BASE_URL",
     "DEFAULT_TIMEOUT_SECONDS",
     "EpsClient",
+    "WatchConnectionError",
     "resolve_base_url",
 ]
