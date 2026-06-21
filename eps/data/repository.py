@@ -11,12 +11,28 @@ append-only 保護依賴 ``Contribution`` 的唯一約束 ``(round_id, seq)``：
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Tuple
 
 from sqlalchemy.engine import Engine
-from sqlmodel import Session as DBSession
+from sqlmodel import Session as DBSession, select
 
-from eps.data.models import Contribution, Session, SessionExpert
+from eps.data.models import Contribution, Round, Session, SessionExpert, SessionStatus
+
+
+@dataclass(frozen=True)
+class SessionDetail:
+    """``get_session_detail`` 回傳的完整會話聚合（Story 2.4 / AC-2）。
+
+    ``experts`` 依 ``order_index``、``rounds`` 依 ``round_number``、``contributions``
+    依 ``(round_id, seq)`` 排序；``final_report`` 取自 ``Session.final_report``。
+    """
+
+    session: Session
+    experts: List[SessionExpert]
+    rounds: List[Round]
+    contributions: List[Contribution]
+    final_report: Optional[str]
 
 
 class Repository:
@@ -75,3 +91,120 @@ class Repository:
             db.commit()
             db.refresh(contribution)
             return contribution
+
+    def list_sessions(
+        self,
+        status: Optional[SessionStatus] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Session]:
+        """列出會話，最近建立優先，可依 status 過濾（AC-1）。
+
+        依 ``created_at`` 遞減排序；同一時間戳以 ``id`` 遞減作穩定次序（最新優先）。
+        ``status`` 為 ``None`` 時不過濾。``limit`` / ``offset`` 提供分頁。
+        """
+        with DBSession(self._engine) as db:
+            stmt = select(Session)
+            if status is not None:
+                stmt = stmt.where(Session.status == status)
+            stmt = (
+                stmt.order_by(Session.created_at.desc(), Session.id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+            return list(db.exec(stmt).all())
+
+    def get_session_detail(self, session_id: int) -> Optional[SessionDetail]:
+        """回傳含 rounds/contributions/final_report 的完整會話聚合（AC-2）。
+
+        會話不存在時回傳 ``None``（含已被 ``delete_session`` 刪除者，AC-4 的「找不到」）。
+        """
+        with DBSession(self._engine) as db:
+            session = db.get(Session, session_id)
+            if session is None:
+                return None
+
+            experts = list(
+                db.exec(
+                    select(SessionExpert)
+                    .where(SessionExpert.session_id == session_id)
+                    .order_by(SessionExpert.order_index)
+                ).all()
+            )
+            rounds = list(
+                db.exec(
+                    select(Round)
+                    .where(Round.session_id == session_id)
+                    .order_by(Round.round_number)
+                ).all()
+            )
+            round_ids = [r.id for r in rounds]
+            contributions: List[Contribution] = []
+            if round_ids:
+                contributions = list(
+                    db.exec(
+                        select(Contribution)
+                        .where(Contribution.round_id.in_(round_ids))
+                        .order_by(Contribution.round_id, Contribution.seq)
+                    ).all()
+                )
+
+            return SessionDetail(
+                session=session,
+                experts=experts,
+                rounds=rounds,
+                contributions=contributions,
+                final_report=session.final_report,
+            )
+
+    def get_resume_position(self, session_id: int) -> Optional[Tuple[int, int]]:
+        """回傳目前最大的 ``(round_number, seq)`` 續跑座標（AC-3）。
+
+        以 ``Contribution`` 接回所屬 ``Round``，取字典序最大的
+        ``(round_number, seq)``（最高回合、且該回合最高序號的發言）。會話尚無任何
+        發言（含不存在的會話）時回傳 ``None``，表示應從頭開始。
+        """
+        with DBSession(self._engine) as db:
+            row = db.exec(
+                select(Round.round_number, Contribution.seq)
+                .join(Contribution, Contribution.round_id == Round.id)
+                .where(Round.session_id == session_id)
+                .order_by(Round.round_number.desc(), Contribution.seq.desc())
+            ).first()
+            if row is None:
+                return None
+            return (row[0], row[1])
+
+    def delete_session(self, session_id: int) -> bool:
+        """真刪會話與其全部子資料，單一 transaction（AC-4）。
+
+        依外鍵相依由子到父刪除 contributions → rounds / experts → session。
+        刪除成功回傳 ``True``；會話不存在回傳 ``False``。
+        """
+        with DBSession(self._engine) as db:
+            session = db.get(Session, session_id)
+            if session is None:
+                return False
+
+            rounds = list(
+                db.exec(
+                    select(Round).where(Round.session_id == session_id)
+                ).all()
+            )
+            round_ids = [r.id for r in rounds]
+            if round_ids:
+                contributions = db.exec(
+                    select(Contribution).where(Contribution.round_id.in_(round_ids))
+                ).all()
+                for contribution in contributions:
+                    db.delete(contribution)
+            experts = db.exec(
+                select(SessionExpert).where(SessionExpert.session_id == session_id)
+            ).all()
+            for expert in experts:
+                db.delete(expert)
+            for rnd in rounds:
+                db.delete(rnd)
+            db.delete(session)
+            db.commit()
+            return True

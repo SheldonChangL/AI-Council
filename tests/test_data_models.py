@@ -154,3 +154,18 @@ def test_full_session_graph_persists():
         assert reloaded.topic == "是否升息"
         assert reloaded.max_rounds == 3
     engine.dispose()
+
+
+# --- Story 2.4：Session.final_report 預設 None 且可持久化 ---
+def test_session_final_report_defaults_none_and_persists():
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with DBSession(engine) as db:
+        sess = Session(topic="t", max_rounds=3)
+        assert sess.final_report is None
+        sess.final_report = "最終綜整報告"
+        db.add(sess)
+        db.commit()
+        reloaded = db.get(Session, sess.id)
+        assert reloaded.final_report == "最終綜整報告"
+    engine.dispose()
